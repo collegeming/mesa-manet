@@ -10,7 +10,7 @@ const METRICS: usize = 6;
 fn count_block(model: &dyn Model, block: &BasicBlock) -> [u32; METRICS] {
     let mut counts = [0_u32; METRICS];
     for instr in &block.instrs {
-        if matches!(instr.op, Op::Nop(_) | Op::BlendCall(_)) {
+        if matches!(instr.op, Op::Nop(_) | Op::BlendCall(_) | Op::PilotJump(_)) {
             continue;
         }
         if let Some(class) = exec_class(model, &instr.op) {

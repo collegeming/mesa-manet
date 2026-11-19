@@ -3846,6 +3846,198 @@
       </expression>
     </field>
   </instruction>
+  <instruction name="CSEL_IMM" variant="s32" exec_unit="cvt" since="15" until="15">
+    <syntax>
+      <name>
+        <modifier name="flow"/>
+        <modifier name="cmpf"/>
+      </name>
+      <dest>
+        <modifier name="dest_width"/>
+      </dest>
+      <src name="src0"/>
+      <uint name="imm"/>
+      <src name="src2"/>
+      <src name="src3"/>
+    </syntax>
+    <virtual name="src0" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src0_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src0_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src0_lo" pos="0" width="8">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <virtual name="src2" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src2_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src2_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <virtual name="src3" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src3_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src3_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src2_lo" pos="16" width="8">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <field name="src3_lo" pos="24" width="8">
+      <expression operator="slice">
+        <expression identifier="src3"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <reserved pos="32" width="1" type="zero"/>
+    <field name="cmpf" pos="33" width="3" type="cmpf_m" restrict="eq gt lt"/>
+    <field name="opcode2" pos="36" width="1" type="csel_opcode2_t" exact="CSEL_IMM"/>
+    <field name="datatype" pos="37" width="3" type="data_type_32_16_8_t" exact="s32"/>
+    <field name="dest_register_index" pos="40" width="8" type="uint" max="127"/>
+    <field name="src0_hi" pos="48" width="1">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <reserved pos="49" width="1" type="zero"/>
+    <field name="src2_hi" pos="50" width="1">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="src3_hi" pos="51" width="1">
+      <expression operator="slice">
+        <expression identifier="src3"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="opcode1" pos="52" width="1" type="R4_opcode1_t" exact="CSEL"/>
+    <field name="dest_width" pos="53" width="2" type="dest_width_m"/>
+    <field name="instruction_class" pos="55" width="3" type="instruction_major_class_t" exact="dst32_operands4"/>
+    <field name="flow" pos="58" width="4" type="flow_control_m"/>
+    <field name="fau_page_index" pos="62" width="2" type="uint"/>
+    <field name="imm" pos="8" width="8" type="uint"/>
+  </instruction>
+  <instruction name="CSEL_IMM" variant="u32" exec_unit="cvt" since="15" until="15">
+    <syntax>
+      <name>
+        <modifier name="flow"/>
+        <modifier name="cmpf"/>
+      </name>
+      <dest>
+        <modifier name="dest_width"/>
+      </dest>
+      <src name="src0"/>
+      <uint name="imm"/>
+      <src name="src2"/>
+      <src name="src3"/>
+    </syntax>
+    <virtual name="src0" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src0_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src0_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src0_lo" pos="0" width="8">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <virtual name="src2" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src2_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src2_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <virtual name="src3" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src3_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src3_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src2_lo" pos="16" width="8">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <field name="src3_lo" pos="24" width="8">
+      <expression operator="slice">
+        <expression identifier="src3"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <reserved pos="32" width="1" type="zero"/>
+    <field name="cmpf" pos="33" width="3" type="cmpf_m" restrict="eq gt lt"/>
+    <field name="opcode2" pos="36" width="1" type="csel_opcode2_t" exact="CSEL_IMM"/>
+    <field name="datatype" pos="37" width="3" type="data_type_32_16_8_t" exact="u32"/>
+    <field name="dest_register_index" pos="40" width="8" type="uint" max="127"/>
+    <field name="src0_hi" pos="48" width="1">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <reserved pos="49" width="1" type="zero"/>
+    <field name="src2_hi" pos="50" width="1">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="src3_hi" pos="51" width="1">
+      <expression operator="slice">
+        <expression identifier="src3"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="opcode1" pos="52" width="1" type="R4_opcode1_t" exact="CSEL"/>
+    <field name="dest_width" pos="53" width="2" type="dest_width_m"/>
+    <field name="instruction_class" pos="55" width="3" type="instruction_major_class_t" exact="dst32_operands4"/>
+    <field name="flow" pos="58" width="4" type="flow_control_m"/>
+    <field name="fau_page_index" pos="62" width="2" type="uint"/>
+    <field name="imm" pos="8" width="8" type="uint"/>
+  </instruction>
   <instruction name="CUBEFACE1" exec_unit="cvt" since="15" until="15">
     <syntax>
       <name>
@@ -7406,6 +7598,232 @@
       </expression>
     </field>
   </instruction>
+  <instruction name="FMAX3" variant="f32" exec_unit="cvt" since="15" until="15">
+    <syntax>
+      <name>
+        <modifier name="flow"/>
+        <modifier name="sem"/>
+      </name>
+      <dest>
+        <modifier name="dest_width"/>
+      </dest>
+      <src name="src0">
+        <modifier name="widen0"/>
+        <modifier name="abs0"/>
+        <modifier name="neg0"/>
+      </src>
+      <src name="src1">
+        <modifier name="widen1"/>
+        <modifier name="abs1"/>
+        <modifier name="neg1"/>
+      </src>
+      <src name="src2">
+        <modifier name="widen2"/>
+        <modifier name="abs2"/>
+        <modifier name="neg2"/>
+      </src>
+    </syntax>
+    <virtual name="src0" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src0_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src0_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src0_lo" pos="0" width="8">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <virtual name="src1" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src1_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src1_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <virtual name="src2" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src2_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src2_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src2_lo" pos="16" width="8">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <field name="widen2" pos="24" width="2" type="widen_m" default="none"/>
+    <field name="widen1" pos="26" width="2" type="widen_m" default="none"/>
+    <field name="widen0" pos="28" width="2" type="widen_m" default="none"/>
+    <field name="datatype_float" pos="30" width="1" type="data_type_float_t" exact="f32"/>
+    <field name="opcode2" pos="31" width="2" type="R3_cmp_minmax3_opcode2_t" exact="FMAX3"/>
+    <field name="sem" pos="33" width="1" type="sem_m" default="nan_suppress"/>
+    <field name="neg2" pos="34" width="1" type="neg_m" default="none"/>
+    <field name="abs2" pos="35" width="1" type="abs_m" default="none"/>
+    <field name="neg1" pos="36" width="1" type="neg_m" default="none"/>
+    <field name="abs1" pos="37" width="1" type="abs_m" default="none"/>
+    <field name="neg0" pos="38" width="1" type="neg_m" default="none"/>
+    <field name="abs0" pos="39" width="1" type="abs_m" default="none"/>
+    <field name="dest_register_index" pos="40" width="8" type="uint" max="127"/>
+    <field name="src0_hi" pos="48" width="1">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="src1_hi" pos="49" width="1">
+      <expression operator="slice">
+        <expression identifier="src1"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="src2_hi" pos="50" width="1">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="opcode1" pos="51" width="2" type="R3_cmp_opcode1_t" exact="MINMAX3"/>
+    <field name="dest_width" pos="53" width="2" type="dest_width_m"/>
+    <field name="instruction_class" pos="55" width="3" type="instruction_major_class_t" exact="dst32_operands3cmp"/>
+    <field name="flow" pos="58" width="4" type="flow_control_m"/>
+    <field name="fau_page_index" pos="62" width="2" type="uint"/>
+    <field name="src1_lo" pos="8" width="8">
+      <expression operator="slice">
+        <expression identifier="src1"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+  </instruction>
+  <instruction name="FMAX3" variant="v2f16" exec_unit="cvt" since="15" until="15">
+    <syntax>
+      <name>
+        <modifier name="flow"/>
+        <modifier name="sem"/>
+      </name>
+      <dest>
+        <modifier name="dest_width"/>
+      </dest>
+      <src name="src0">
+        <modifier name="swz0"/>
+        <modifier name="abs0"/>
+        <modifier name="neg0"/>
+      </src>
+      <src name="src1">
+        <modifier name="swz1"/>
+        <modifier name="abs1"/>
+        <modifier name="neg1"/>
+      </src>
+      <src name="src2">
+        <modifier name="swz2"/>
+        <modifier name="abs2"/>
+        <modifier name="neg2"/>
+      </src>
+    </syntax>
+    <virtual name="src0" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src0_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src0_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src0_lo" pos="0" width="8">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <virtual name="src1" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src1_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src1_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <virtual name="src2" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src2_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src2_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src2_lo" pos="16" width="8">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <field name="swz2" pos="24" width="2" type="swiz_m" default="h01"/>
+    <field name="swz1" pos="26" width="2" type="swiz_m" default="h01"/>
+    <field name="swz0" pos="28" width="2" type="swiz_m" default="h01"/>
+    <field name="datatype_float" pos="30" width="1" type="data_type_float_t" exact="v2f16"/>
+    <field name="opcode2" pos="31" width="2" type="R3_cmp_minmax3_opcode2_t" exact="FMAX3"/>
+    <field name="sem" pos="33" width="1" type="sem_m" default="nan_suppress"/>
+    <field name="neg2" pos="34" width="1" type="neg_m" default="none"/>
+    <field name="abs2" pos="35" width="1" type="abs_m" default="none"/>
+    <field name="neg1" pos="36" width="1" type="neg_m" default="none"/>
+    <field name="abs1" pos="37" width="1" type="abs_m" default="none"/>
+    <field name="neg0" pos="38" width="1" type="neg_m" default="none"/>
+    <field name="abs0" pos="39" width="1" type="abs_m" default="none"/>
+    <field name="dest_register_index" pos="40" width="8" type="uint" max="127"/>
+    <field name="src0_hi" pos="48" width="1">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="src1_hi" pos="49" width="1">
+      <expression operator="slice">
+        <expression identifier="src1"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="src2_hi" pos="50" width="1">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="opcode1" pos="51" width="2" type="R3_cmp_opcode1_t" exact="MINMAX3"/>
+    <field name="dest_width" pos="53" width="2" type="dest_width_m"/>
+    <field name="instruction_class" pos="55" width="3" type="instruction_major_class_t" exact="dst32_operands3cmp"/>
+    <field name="flow" pos="58" width="4" type="flow_control_m"/>
+    <field name="fau_page_index" pos="62" width="2" type="uint"/>
+    <field name="src1_lo" pos="8" width="8">
+      <expression operator="slice">
+        <expression identifier="src1"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+  </instruction>
   <instruction name="FMA_RSCALE" variant="f32" exec_unit="fma" since="15" until="15">
     <syntax>
       <name>
@@ -7758,6 +8176,232 @@
     <field name="datatype" pos="50" width="3" type="data_type_32_16_8_t" exact="v2f16"/>
     <field name="dest_width" pos="53" width="2" type="dest_width_m"/>
     <field name="instruction_class" pos="55" width="3" type="instruction_major_class_t" exact="dst32_operands2"/>
+    <field name="flow" pos="58" width="4" type="flow_control_m"/>
+    <field name="fau_page_index" pos="62" width="2" type="uint"/>
+    <field name="src1_lo" pos="8" width="8">
+      <expression operator="slice">
+        <expression identifier="src1"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+  </instruction>
+  <instruction name="FMIN3" variant="f32" exec_unit="cvt" since="15" until="15">
+    <syntax>
+      <name>
+        <modifier name="flow"/>
+        <modifier name="sem"/>
+      </name>
+      <dest>
+        <modifier name="dest_width"/>
+      </dest>
+      <src name="src0">
+        <modifier name="widen0"/>
+        <modifier name="abs0"/>
+        <modifier name="neg0"/>
+      </src>
+      <src name="src1">
+        <modifier name="widen1"/>
+        <modifier name="abs1"/>
+        <modifier name="neg1"/>
+      </src>
+      <src name="src2">
+        <modifier name="widen2"/>
+        <modifier name="abs2"/>
+        <modifier name="neg2"/>
+      </src>
+    </syntax>
+    <virtual name="src0" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src0_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src0_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src0_lo" pos="0" width="8">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <virtual name="src1" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src1_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src1_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <virtual name="src2" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src2_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src2_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src2_lo" pos="16" width="8">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <field name="widen2" pos="24" width="2" type="widen_m" default="none"/>
+    <field name="widen1" pos="26" width="2" type="widen_m" default="none"/>
+    <field name="widen0" pos="28" width="2" type="widen_m" default="none"/>
+    <field name="datatype_float" pos="30" width="1" type="data_type_float_t" exact="f32"/>
+    <field name="opcode2" pos="31" width="2" type="R3_cmp_minmax3_opcode2_t" exact="FMIN3"/>
+    <field name="sem" pos="33" width="1" type="sem_m" default="nan_suppress"/>
+    <field name="neg2" pos="34" width="1" type="neg_m" default="none"/>
+    <field name="abs2" pos="35" width="1" type="abs_m" default="none"/>
+    <field name="neg1" pos="36" width="1" type="neg_m" default="none"/>
+    <field name="abs1" pos="37" width="1" type="abs_m" default="none"/>
+    <field name="neg0" pos="38" width="1" type="neg_m" default="none"/>
+    <field name="abs0" pos="39" width="1" type="abs_m" default="none"/>
+    <field name="dest_register_index" pos="40" width="8" type="uint" max="127"/>
+    <field name="src0_hi" pos="48" width="1">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="src1_hi" pos="49" width="1">
+      <expression operator="slice">
+        <expression identifier="src1"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="src2_hi" pos="50" width="1">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="opcode1" pos="51" width="2" type="R3_cmp_opcode1_t" exact="MINMAX3"/>
+    <field name="dest_width" pos="53" width="2" type="dest_width_m"/>
+    <field name="instruction_class" pos="55" width="3" type="instruction_major_class_t" exact="dst32_operands3cmp"/>
+    <field name="flow" pos="58" width="4" type="flow_control_m"/>
+    <field name="fau_page_index" pos="62" width="2" type="uint"/>
+    <field name="src1_lo" pos="8" width="8">
+      <expression operator="slice">
+        <expression identifier="src1"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+  </instruction>
+  <instruction name="FMIN3" variant="v2f16" exec_unit="cvt" since="15" until="15">
+    <syntax>
+      <name>
+        <modifier name="flow"/>
+        <modifier name="sem"/>
+      </name>
+      <dest>
+        <modifier name="dest_width"/>
+      </dest>
+      <src name="src0">
+        <modifier name="swz0"/>
+        <modifier name="abs0"/>
+        <modifier name="neg0"/>
+      </src>
+      <src name="src1">
+        <modifier name="swz1"/>
+        <modifier name="abs1"/>
+        <modifier name="neg1"/>
+      </src>
+      <src name="src2">
+        <modifier name="swz2"/>
+        <modifier name="abs2"/>
+        <modifier name="neg2"/>
+      </src>
+    </syntax>
+    <virtual name="src0" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src0_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src0_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src0_lo" pos="0" width="8">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <virtual name="src1" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src1_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src1_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <virtual name="src2" type="SourceEncoding">
+      <expression operator="bitwise_or">
+        <expression identifier="src2_lo"/>
+        <expression operator="lshift">
+          <expression identifier="src2_hi"/>
+          <expression literal="8" type="uint"/>
+        </expression>
+      </expression>
+    </virtual>
+    <field name="src2_lo" pos="16" width="8">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="7" type="uint"/>
+        <expression literal="0" type="uint"/>
+      </expression>
+    </field>
+    <field name="swz2" pos="24" width="2" type="swiz_m" default="h01"/>
+    <field name="swz1" pos="26" width="2" type="swiz_m" default="h01"/>
+    <field name="swz0" pos="28" width="2" type="swiz_m" default="h01"/>
+    <field name="datatype_float" pos="30" width="1" type="data_type_float_t" exact="v2f16"/>
+    <field name="opcode2" pos="31" width="2" type="R3_cmp_minmax3_opcode2_t" exact="FMIN3"/>
+    <field name="sem" pos="33" width="1" type="sem_m" default="nan_suppress"/>
+    <field name="neg2" pos="34" width="1" type="neg_m" default="none"/>
+    <field name="abs2" pos="35" width="1" type="abs_m" default="none"/>
+    <field name="neg1" pos="36" width="1" type="neg_m" default="none"/>
+    <field name="abs1" pos="37" width="1" type="abs_m" default="none"/>
+    <field name="neg0" pos="38" width="1" type="neg_m" default="none"/>
+    <field name="abs0" pos="39" width="1" type="abs_m" default="none"/>
+    <field name="dest_register_index" pos="40" width="8" type="uint" max="127"/>
+    <field name="src0_hi" pos="48" width="1">
+      <expression operator="slice">
+        <expression identifier="src0"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="src1_hi" pos="49" width="1">
+      <expression operator="slice">
+        <expression identifier="src1"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="src2_hi" pos="50" width="1">
+      <expression operator="slice">
+        <expression identifier="src2"/>
+        <expression literal="8" type="uint"/>
+        <expression literal="8" type="uint"/>
+      </expression>
+    </field>
+    <field name="opcode1" pos="51" width="2" type="R3_cmp_opcode1_t" exact="MINMAX3"/>
+    <field name="dest_width" pos="53" width="2" type="dest_width_m"/>
+    <field name="instruction_class" pos="55" width="3" type="instruction_major_class_t" exact="dst32_operands3cmp"/>
     <field name="flow" pos="58" width="4" type="flow_control_m"/>
     <field name="fau_page_index" pos="62" width="2" type="uint"/>
     <field name="src1_lo" pos="8" width="8">
@@ -31522,7 +32166,9 @@
     <value name="FSINCOS" canonical="1" value="2"/>
   </enum>
   <enum name="R3_cmp_minmax3_opcode2_t" since="15" until="15">
+    <value name="FMIN3" canonical="1" value="0"/>
     <value name="FCLAMP" canonical="1" value="1"/>
+    <value name="FMAX3" canonical="1" value="3"/>
   </enum>
   <enum name="R3_cmp_misc_opcode2_t" since="15" until="15">
     <value name="CMP_MULTI" canonical="1" value="0"/>
@@ -31690,6 +32336,7 @@
   </enum>
   <enum name="csel_opcode2_t" since="15" until="15">
     <value name="CSEL" canonical="1" value="0"/>
+    <value name="CSEL_IMM" canonical="1" value="1"/>
   </enum>
   <enum name="cube_coord_select_t" since="15" until="15">
     <value name="s" canonical="1" value="0"/>

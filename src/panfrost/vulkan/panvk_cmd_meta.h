@@ -24,7 +24,7 @@ struct panvk_cmd_meta_compute_save_ctx {
    } cs;
    const struct panvk_descriptor_set *set0;
    struct {
-      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS];
+      struct panvk_opaque_desc desc_storage[PANVK_MAX_PUSH_DESC_SLOTS];
       uint64_t descs_dev_addr;
       uint32_t desc_count;
       bool dirty;
@@ -41,7 +41,7 @@ struct panvk_cmd_meta_graphics_save_ctx {
    const struct panvk_graphics_pipeline *pipeline;
    const struct panvk_descriptor_set *set0;
    struct {
-      struct panvk_opaque_desc desc_storage[MAX_PUSH_DESCS];
+      struct panvk_opaque_desc desc_storage[PANVK_MAX_PUSH_DESC_SLOTS];
       uint64_t descs_dev_addr;
       uint32_t desc_count;
       bool dirty;
@@ -62,8 +62,13 @@ struct panvk_cmd_meta_graphics_save_ctx {
 
    struct {
       const struct panvk_shader *shader;
+      const struct panvk_shader *bound;
       struct panvk_shader_desc_state desc;
    } vs;
+
+   const struct panvk_shader *tcs;
+   const struct panvk_shader *tes;
+   const struct panvk_shader *tes_bound;
 
    struct panvk_occlusion_query_state occlusion_query;
    bool cond_render_enabled;
@@ -87,5 +92,23 @@ void panvk_per_arch(cmd_meta_compute_end)(
 void panvk_per_arch(cmd_fill_buffer_addr)(VkCommandBuffer commandBuffer,
                                           VkDeviceAddress addr,
                                           VkDeviceSize size, uint32_t data);
+
+#if PAN_ARCH >= 10
+struct panvk_image;
+
+void panvk_per_arch(cmd_bc_emu_decode)(struct panvk_cmd_buffer *cmdbuf,
+                                       struct panvk_image *img,
+                                       const VkImageSubresourceLayers *sub,
+                                       VkOffset3D offset, VkExtent3D extent);
+
+void panvk_per_arch(cmd_copy_blocks_to_image)(
+   struct panvk_cmd_buffer *cmdbuf, const VkCopyDeviceMemoryImageInfoKHR *info);
+
+void panvk_per_arch(cmd_copy_blocks_from_image)(
+   struct panvk_cmd_buffer *cmdbuf, const VkCopyDeviceMemoryImageInfoKHR *info);
+
+void panvk_per_arch(cmd_copy_blocks_image)(struct panvk_cmd_buffer *cmdbuf,
+                                           const VkCopyImageInfo2 *info);
+#endif
 
 #endif

@@ -17,11 +17,13 @@
 #include "genxml/cs_builder.h"
 
 #include "panvk_cmd_desc_state.h"
+#include "panvk_dynamic_cache.h"
 #include "panvk_cmd_dispatch.h"
 #include "panvk_cmd_draw.h"
 #include "panvk_cmd_push_constant.h"
 #include "panvk_cmd_ray_tracing.h"
 #include "panvk_queue.h"
+#include "panvk_utrace.h"
 
 #include "vk_command_buffer.h"
 #include "vk_synchronization.h"
@@ -55,10 +57,32 @@ struct panvk_cs_sync32 {
    uint32_t error;
 };
 
-struct panvk_preamble_dispatch {
-   const struct panvk_shader_variant *shader;
+#define PANVK_PILOT_PAIRS_MAX    16
+#define PANVK_PILOT_BATCH_MAX    1024
+#define PANVK_PILOT_INDIRECT_MAX 64
+
+struct panvk_pilot_guard {
+   uint64_t params;
+   uint64_t count;
+   uint32_t words;
+   uint32_t index;
+};
+
+struct panvk_pilot_entry {
    uint64_t fau;
    uint64_t srt;
+   uint64_t pc;
+   uint64_t guard;
+   uint32_t ftz;
+};
+
+struct panvk_pilot_batch {
+   struct util_dynarray entries;
+   uint32_t *fau;
+   struct cs_maybe *grid;
+   uint32_t code_hi;
+   uint32_t ftz;
+   bool open;
 };
 
 struct panvk_cs_sync64 {
@@ -142,6 +166,8 @@ struct panvk_fb_layer_state {
    /** GPU address to the per-region counter GENERIC_PLANE. It may be 0. */
    uint64_t perf_counter_plane;
 #endif
+
+   struct mali_vrs_image_packed vrs_image;
 } __attribute__((aligned(64)));
 #endif /* PAN_ARCH >= 14 */
 
@@ -190,12 +216,8 @@ struct panvk_cs_occlusion_query {
 
 struct panvk_cs_subqueue_context {
    uint64_t syncobjs;
-#if PAN_ARCH == 10
    /* must follow syncobjs immediately for cs_load_to */
    uint32_t iter_sb;
-#else
-   uint32_t pad;
-#endif
    uint32_t last_error;
    uint64_t reg_dump_addr;
    struct {
@@ -350,7 +372,7 @@ enum panvk_cs_regs {
    /* RUN_FRAGMENT2 RW staging regs. The rest are initialized to zero at
     * command stream initialization, and should never be touched again. */
    PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_0_START = 28,
-   PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_0_END = 47,
+   PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_0_END = 49,
 #if PAN_ARCH >= 15
    PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_1_START = 50,
    PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_1_END = 53,
@@ -602,21 +624,11 @@ struct panvk_cond_render_state {
    enum mali_cs_condition exec_cond;
 };
 
-/* Source addresses of the promoted UBO words (pan_fau_foreach_reloc) that a
- * stage's current FAU buffer was filled from, indexed by FAU word (0: the
- * word reads as zero). shader is NULL when the buffer has to be rebuilt:
- * nothing was copied yet, or a dependency recorded since the copy may have
- * made new buffer contents visible. */
-struct panvk_fau_ubo_words {
-   const struct panvk_shader_variant *shader;
-   uint64_t src[PAN_MAX_PUSH];
-};
-
-/* A run of promoted UBO words, contiguous in memory and in a FAU buffer. */
-struct panvk_fau_copy {
-   uint64_t src;
-   uint64_t dst;
-   uint32_t count;
+struct panvk_cache_pass {
+   struct list_head link;
+   struct panvk_cache_policy policy;
+   uint16_t id;
+   bool compute;
 };
 
 struct panvk_cmd_buffer {
@@ -634,26 +646,32 @@ struct panvk_cmd_buffer {
 
    struct list_head push_sets;
    struct list_head dgc_records;
+   struct list_head cache_passes;
+   struct panvk_cache_policy cache_pending;
+   uint32_t cache_pass_count;
 
-   /* Promoted UBO word copies (struct panvk_fau_copy). vs is scratch space
-    * for the vertex or compute shader being prepared; fs holds the copies of
-    * the fragment shaders of the current render pass, which the fragment
-    * subqueue runs before the fragment job (cmd_flush_fs_fau_copies), while
-    * the vertex/tiler work of the pass runs unless fs_after_tiling. */
    struct {
-      struct util_dynarray vs, fs;
+      struct panvk_pilot_batch vt;
+      struct panvk_pilot_batch cs;
+      struct util_dynarray fs;
       bool fs_after_tiling;
-   } fau_copies;
-   struct util_dynarray fs_preambles;
+   } pilots;
 
    struct {
       struct u_trace uts[PANVK_SUBQUEUE_COUNT];
+      uint32_t pass_index[PANVK_SUBQUEUE_COUNT];
+      uint32_t pass_depth[PANVK_SUBQUEUE_COUNT];
+      struct panvk_utrace_pass passes[PANVK_SUBQUEUE_COUNT][8];
    } utrace;
 
    struct {
       struct panvk_cmd_graphics_state gfx;
       struct panvk_cmd_compute_state compute;
       struct panvk_cmd_ray_tracing_state ray_tracing;
+      struct {
+         const struct vk_pipeline *pipeline;
+         struct panvk_descriptor_state desc_state;
+      } data_graph;
       struct panvk_push_constant_state push_constants;
       struct panvk_cs_state cs[PANVK_SUBQUEUE_COUNT];
       struct panvk_tls_state tls;
@@ -665,11 +683,6 @@ struct panvk_cmd_buffer {
       struct panvk_cond_render_state cond_render;
 
       struct panvk_shader_instrumentation *shader_instr;
-
-      /* Promoted UBO words of the current VS and FS FAU buffers. */
-      struct {
-         struct panvk_fau_ubo_words vs, fs;
-      } fau_ubo;
    } state;
 };
 
@@ -758,6 +771,9 @@ panvk_cmd_get_desc_state(struct panvk_cmd_buffer *cmdbuf,
    case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR:
       return &cmdbuf->state.ray_tracing.desc_state;
 
+   case VK_PIPELINE_BIND_POINT_DATA_GRAPH_ARM:
+      return &cmdbuf->state.data_graph.desc_state;
+
    default:
       assert(!"Unsupported bind point");
       return NULL;
@@ -774,6 +790,10 @@ panvk_cache_flush_is_nop(const struct panvk_cache_flush_info *cache_flush)
 }
 
 extern const struct vk_command_buffer_ops panvk_per_arch(cmd_buffer_ops);
+
+void panvk_per_arch(cmd_cache_reset)(struct panvk_cmd_buffer *cmdbuf);
+void panvk_per_arch(cmd_cache_begin)(struct panvk_cmd_buffer *cmdbuf, bool compute);
+void panvk_per_arch(cmd_cache_end)(struct panvk_cmd_buffer *cmdbuf, bool compute);
 
 void panvk_per_arch(cmd_fb_barrier)(struct panvk_cmd_buffer *cmdbuf);
 
@@ -832,6 +852,8 @@ cs_iter_sb_update_end(struct cs_iter_sb_update_ctx *ctx)
    cs_move32_to(b, sb_mask, 0);
    cs_bit_set32(b, sb_mask, sb_mask, next_sb);
    cs_set_state(b, MALI_CS_SET_STATE_TYPE_SB_MASK_WAIT, sb_mask);
+   cs_store32(b, next_sb, cs_subqueue_ctx_reg(b),
+              offsetof(struct panvk_cs_subqueue_context, iter_sb));
 
    /* Prevent direct re-use of the current SB to avoid conflict between
     * wait(current),signal(next) (can't wait on an SB we signal).
@@ -1029,29 +1051,33 @@ void panvk_per_arch(cmd_dispatch_shader)(
    uint64_t push_uniforms, uint64_t tsd,
    const struct panvk_dispatch_info *info);
 
-bool panvk_per_arch(shader_has_fau_ubo_words)(
-   const struct panvk_shader_variant *shader);
+bool panvk_per_arch(cmd_pilot_queue)(struct panvk_cmd_buffer *cmdbuf,
+                                     enum panvk_subqueue_id subqueue,
+                                     const struct panvk_shader_variant *shader,
+                                     uint64_t fau, uint64_t srt,
+                                     const struct panvk_pilot_guard *guard);
 
-bool panvk_per_arch(resolve_fau_ubo_words)(
-   const struct panvk_shader_variant *shader,
-   const struct panvk_descriptor_state *desc_state,
-   const struct panvk_shader_desc_state *shader_desc,
-   struct panvk_fau_ubo_words *words);
+void panvk_per_arch(cmd_pilot_close)(struct panvk_cmd_buffer *cmdbuf,
+                                     enum panvk_subqueue_id subqueue);
 
-void panvk_per_arch(get_fau_ubo_copies)(
-   const struct panvk_shader_variant *shader,
-   const struct panvk_fau_ubo_words *words, struct pan_ptr fau,
-   uint32_t repeat_count, struct util_dynarray *copies);
+void panvk_per_arch(cmd_pilot_close_all)(struct panvk_cmd_buffer *cmdbuf);
 
-void panvk_per_arch(cs_emit_fau_copies)(struct cs_builder *b,
-                                        const struct util_dynarray *copies);
+void panvk_per_arch(cmd_pilots_init)(struct panvk_cmd_buffer *cmdbuf);
 
-void panvk_per_arch(cmd_flush_fs_fau_copies)(struct panvk_cmd_buffer *cmdbuf);
+void panvk_per_arch(cmd_pilots_reset)(struct panvk_cmd_buffer *cmdbuf);
 
-void panvk_per_arch(cmd_emit_preamble)(
-   struct panvk_cmd_buffer *cmdbuf, enum panvk_subqueue_id subqueue,
-   const struct panvk_shader_variant *shader, struct cs_index fau,
-   struct cs_index srt);
+void panvk_per_arch(cmd_pilots_fini)(struct panvk_cmd_buffer *cmdbuf);
+
+void panvk_per_arch(cmd_pilot_run)(struct panvk_cmd_buffer *cmdbuf,
+                                   enum panvk_subqueue_id subqueue,
+                                   const struct panvk_shader_variant *shader,
+                                   struct cs_index fau, struct cs_index srt);
+
+VkResult panvk_per_arch(cmd_pilot_queue_fs)(
+   struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,
+   uint64_t fau, uint64_t srt);
+
+void panvk_per_arch(cmd_flush_fs_pilots)(struct panvk_cmd_buffer *cmdbuf);
 
 static VkPipelineStageFlags2
 panvk_get_subqueue_stages(enum panvk_subqueue_id subqueue)
@@ -1062,9 +1088,12 @@ panvk_get_subqueue_stages(enum panvk_subqueue_id subqueue)
              VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
              VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
              VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
              VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
    case PANVK_SUBQUEUE_FRAGMENT:
-      return VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+      return VK_PIPELINE_STAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR |
+             VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
@@ -1073,6 +1102,10 @@ panvk_get_subqueue_stages(enum panvk_subqueue_id subqueue)
              VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
    case PANVK_SUBQUEUE_COMPUTE:
       return VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_TESSELLATION_CONTROL_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_TESSELLATION_EVALUATION_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_GEOMETRY_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_TRANSFORM_FEEDBACK_BIT_EXT |
              VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
              VK_PIPELINE_STAGE_2_COMMAND_PREPROCESS_BIT_EXT |
              VK_PIPELINE_STAGE_2_COPY_BIT |
@@ -1080,6 +1113,8 @@ panvk_get_subqueue_stages(enum panvk_subqueue_id subqueue)
              VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT |
              VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
              VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_COPY_BIT_KHR |
+             VK_PIPELINE_STAGE_2_MICROMAP_BUILD_BIT_EXT |
+             VK_PIPELINE_STAGE_2_DATA_GRAPH_BIT_ARM |
              VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
    default:
       UNREACHABLE("Invalid subqueue id");
@@ -1162,6 +1197,8 @@ cs_emit_layer_fragment_state(struct cs_builder *b, struct cs_index fbd_ptr)
                 offsetof(struct panvk_fb_layer_state, frame_argument));
    cs_load64_to(b, cs_sr_reg64(b, FRAGMENT, FRAME_SHADER_DCD_POINTER), fbd_ptr,
                 offsetof(struct panvk_fb_layer_state, dcd_pointer));
+   cs_load64_to(b, cs_sr_reg64(b, FRAGMENT, VRS_IMAGE), fbd_ptr,
+                offsetof(struct panvk_fb_layer_state, vrs_image));
 }
 #endif /* PAN_ARCH >= 14 */
 

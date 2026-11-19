@@ -3330,6 +3330,23 @@ NIR_DEFINE_SRC_AS_CONST(double, float)
 
 #undef NIR_DEFINE_SRC_AS_CONST
 
+static inline void
+nir_instr_set_speculated(nir_instr *instr)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return;
+
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+
+   if (nir_intrinsic_has_access(intrin) &&
+       (nir_intrinsic_access(intrin) & ACCESS_CAN_SPECULATE)) {
+      nir_intrinsic_set_access(intrin,
+                               (enum gl_access_qualifier)(
+                                  nir_intrinsic_access(intrin) |
+                                  ACCESS_IS_SPECULATED));
+   }
+}
+
 static inline bool
 nir_src_is_zero(nir_src src)
 {
@@ -7054,6 +7071,7 @@ typedef bool (*nir_opt_licm_filter_cb)(nir_instr *instr, nir_loop *loop,
 bool nir_opt_licm(nir_shader *shader,
                   nir_opt_licm_filter_cb filter);
 bool nir_opt_loop(nir_shader *shader);
+bool nir_opt_loop_rotate(nir_shader *shader);
 
 bool nir_opt_loop_unroll(nir_shader *shader);
 
@@ -7146,6 +7164,7 @@ typedef struct nir_opt_peephole_select_options {
    bool indirect_load_ok;
    bool expensive_alu_ok;
    bool discard_ok;
+   unsigned collapse_limit;
 } nir_opt_peephole_select_options;
 
 bool nir_opt_peephole_select(nir_shader *shader,

@@ -49,6 +49,12 @@ struct Arena {
 
     /// True if we are on v9-14 and in 64-reg mode.
     is_v9_64reg: bool,
+
+    const_pref: bool,
+    anti_frag: bool,
+    live_src: bool,
+    rt_call_placement: bool,
+    rt_frame_tls: bool,
 }
 
 impl Arena {
@@ -64,6 +70,11 @@ impl Arena {
             tls_offset: 0,
             is_v9_32reg: model.arch() < 15 && limit <= 32 * 4,
             is_v9_64reg: model.arch() < 15 && limit > 32 * 4,
+            const_pref: false,
+            anti_frag: false,
+            live_src: false,
+            rt_call_placement: false,
+            rt_frame_tls: false,
         }
     }
 
@@ -82,6 +93,11 @@ impl Arena {
             tls_offset: tls_start.next_multiple_of(granularity.into()),
             is_v9_32reg: false,
             is_v9_64reg: false,
+            const_pref: false,
+            anti_frag: false,
+            live_src: false,
+            rt_call_placement: false,
+            rt_frame_tls: false,
         }
     }
 
@@ -97,6 +113,11 @@ impl Arena {
             tls_offset: 0,
             is_v9_32reg: model.arch() < 15,
             is_v9_64reg: false,
+            const_pref: false,
+            anti_frag: false,
+            live_src: false,
+            rt_call_placement: false,
+            rt_frame_tls: false,
         }
     }
 
@@ -119,7 +140,8 @@ impl Arena {
     pub fn regs_used(&self) -> u8 {
         debug_assert!(!self.is_mem);
         debug_assert!(self.bytes_used() % 4 == 0);
-        (self.bytes_used() / 4).try_into().unwrap()
+        let bytes = self.bytes_used().max(self.granularity.into());
+        (bytes / 4).try_into().unwrap()
     }
 
     /// Returns true if the given SSAValue is in this arena
@@ -160,7 +182,9 @@ impl Arena {
 
     /// Returns true if the given range maps to a contiguous range in the arena
     pub fn is_contiguous(&self, bytes: Range<u16>) -> bool {
-        if self.is_v9_32reg {
+        if self.rt_frame_tls {
+            bytes.end <= 20 * 4 || bytes.start >= 20 * 4
+        } else if self.is_v9_32reg {
             bytes.end <= 16 * 4 || bytes.start >= 16 * 4
         } else {
             true
@@ -304,6 +328,7 @@ fn aligned_u16_range(start: u16, len: u16) -> Range<u16> {
 
 pub fn instr_clobbered_regs(model: &dyn Model, op: &Op) -> Vec<RegRef> {
     match op {
+        Op::RtCall(_) => vec![RegRef::new(0, RegRange::Regs(20))],
         Op::BlendCall(_) => {
             let link = model.preload_reg(PreloadReg::BlendReturnAddr).unwrap();
             let blend_arena = Arena::new_blend(model);
@@ -815,13 +840,36 @@ impl AffinityMap {
         // Flatten the UnionFind to an SSAValueIndexedVec for efficiency
         let mut phi_webs: SSAValueIndexedVec<Option<SSAValue>> =
             SSAValueIndexedVec::with_count(s.ssa_alloc.count());
+        let mut members: FxHashMap<SSAValue, Vec<SSAValue>> =
+            FxHashMap::default();
         for (k, v) in b.phi_webs.into_iter() {
             debug_assert_eq!(k.bits(), v.bits());
             phi_webs[k] = Some(v);
+            members.entry(v).or_default().push(k);
+        }
+
+        let mut ssa_affinities = b.ssa_affinities;
+        for web in members.values() {
+            let Some(role) = web
+                .iter()
+                .map(|ssa| &ssa_affinities[*ssa])
+                .find(|a| a.vec_size > 0)
+                .map(|a| (a.vec_repr, a.vec_offset, a.vec_size))
+            else {
+                continue;
+            };
+            for ssa in web {
+                let a = &mut ssa_affinities[*ssa];
+                if a.vec_size == 0 && a.reg_byte().is_none() {
+                    a.vec_repr = role.0;
+                    a.vec_offset = role.1;
+                    a.vec_size = role.2;
+                }
+            }
         }
 
         AffinityMap {
-            ssa_affinities: b.ssa_affinities,
+            ssa_affinities,
             phi_webs,
         }
     }
@@ -967,6 +1015,28 @@ struct LocalRegAlloc<'a> {
 
     /// PinnedByteSet for bytes that are live-in or live-out
     pinned_in_out: PinnedByteSet,
+
+    reg_const: FxHashMap<u8, u32>,
+    dst_const: Option<u64>,
+}
+
+fn copy_const_value(instr: &Instr) -> Option<u64> {
+    let Op::Copy(op) = &instr.op else {
+        return None;
+    };
+    if instr.flow != FlowCtrl::NONE
+        || op.dst.lanes != DstLanes::All
+        || !op.src.swizzle.is_none()
+        || !op.src.src_mod.is_none()
+    {
+        return None;
+    }
+    match (&op.src.src_ref, op.dst_type) {
+        (SrcRef::Zero, DataType::I32 | DataType::I64) => Some(0),
+        (SrcRef::Imm32(v), DataType::I32) => Some(v.get().into()),
+        (SrcRef::Imm64(v), DataType::I64) => Some(v.get()),
+        _ => None,
+    }
 }
 
 impl LocalRegAlloc<'_> {
@@ -989,7 +1059,80 @@ impl LocalRegAlloc<'_> {
             pinned_in: Default::default(),
             pinned_out: Default::default(),
             pinned_in_out: Default::default(),
+            reg_const: Default::default(),
+            dst_const: None,
         }
+    }
+
+    fn note_reg_writes(&mut self, instr: &Instr) {
+        if !self.arena.is_reg() {
+            return;
+        }
+        let value = copy_const_value(instr);
+        for dst in instr.dsts() {
+            let DstRef::Reg(reg) = &dst.dst_ref else {
+                continue;
+            };
+            let bytes = reg.byte_range();
+            let first = bytes.start / 4;
+            for w in first..bytes.end.div_ceil(4) {
+                let idx = u8::try_from(w).unwrap();
+                match value {
+                    Some(v) => {
+                        let word = (v >> (32 * u32::from(w - first))) as u32;
+                        self.reg_const.insert(idx, word);
+                    }
+                    None => {
+                        self.reg_const.remove(&idx);
+                    }
+                }
+            }
+        }
+        for reg in instr_clobbered_regs(self.model, &instr.op) {
+            let bytes = reg.byte_range();
+            for w in (bytes.start / 4)..bytes.end.div_ceil(4) {
+                self.reg_const.remove(&u8::try_from(w).unwrap());
+            }
+        }
+    }
+
+    fn find_const_bytes(
+        &self,
+        p: &PinnedByteSet,
+        nbytes: u8,
+        align: RegAlignConstraint,
+        value: u64,
+    ) -> Option<u16> {
+        if self.reg_const.is_empty() || !(nbytes == 4 || nbytes == 8) {
+            return None;
+        }
+        let words = nbytes / 4;
+        let mut best: Option<(u16, u8)> = None;
+        let mut b = 0_u16;
+        while b + u16::from(nbytes) <= self.arena.limit() {
+            let range = b..(b + u16::from(nbytes));
+            if align.satisfied(b.into())
+                && self.arena.is_contiguous(range.clone())
+                && p.bytes_are_unpinned(range.clone())
+                && self.bytes_are_unused(range.clone())
+            {
+                let reg = self.arena.reg_for_bytes(range);
+                let matched = (0..words)
+                    .filter(|w| {
+                        let word = (value >> (32 * u32::from(*w))) as u32;
+                        self.reg_const.get(&(reg.idx + w)) == Some(&word)
+                    })
+                    .count() as u8;
+                if matched > best.map_or(0, |(_, m)| m) {
+                    best = Some((b, matched));
+                    if matched == words {
+                        break;
+                    }
+                }
+            }
+            b += 4;
+        }
+        best.map(|(b, _)| b)
     }
 
     /// Updates idx_bytes without actually assigning it
@@ -1060,14 +1203,18 @@ impl LocalRegAlloc<'_> {
         self.idx_bytes(ssa.idx())
     }
 
-    fn ssa_bytes_offset(
+    fn repr_bytes_offset(
         &self,
-        ssa: &SSAValue,
+        repr: &SSAValue,
         offset: i16,
     ) -> Option<Range<u16>> {
-        let ssa_bytes = self.ssa_bytes(ssa);
-        let start = ssa_bytes.start.checked_add_signed(offset)?;
-        let end = ssa_bytes.end.checked_add_signed(offset)?;
+        let idx = usize::try_from(repr.idx()).unwrap();
+        let bytes = match self.idx_bytes.get(idx) {
+            Some(bytes) if !bytes.is_empty() => bytes.clone(),
+            _ => self.idx_phi_bytes(repr.idx())?,
+        };
+        let start = bytes.start.checked_add_signed(offset)?;
+        let end = bytes.end.checked_add_signed(offset)?;
         if end > self.arena.limit() {
             return None;
         }
@@ -1178,6 +1325,18 @@ impl LocalRegAlloc<'_> {
             && pinned.bytes_are_unpinned(bytes)
     }
 
+    fn breaks_free_quad(&self, b: u16, bytes: u8) -> u8 {
+        if !self.arena.anti_frag || bytes >= 16 || !self.arena.is_reg() {
+            return 0;
+        }
+        let quad = b & !15;
+        if quad + 16 > self.arena.limit() {
+            return 0;
+        }
+        let quad = usize::from(quad);
+        u8::from(self.used.all_unset_in_range(quad..quad + 16))
+    }
+
     fn find_unpinned_bytes(
         &self,
         pinned: &PinnedByteSet,
@@ -1217,7 +1376,10 @@ impl LocalRegAlloc<'_> {
                 continue;
             }
 
-            let c = (cost_fn(b), 0);
+            let c = (
+                cost_fn(b).saturating_mul(2) + self.breaks_free_quad(b, bytes),
+                0,
+            );
             if c.0 == 0 {
                 return Some(b);
             } else if c < best.1 {
@@ -1253,7 +1415,12 @@ impl LocalRegAlloc<'_> {
                 continue;
             }
 
-            let c = (cost_fn(b), self.eviction_copy_cost(b..b + u16::from(bytes)));
+            let c = (
+                cost_fn(b)
+                    .saturating_mul(2)
+                    .saturating_add(u8::from(self.arena.anti_frag)),
+                self.eviction_copy_cost(b..b + u16::from(bytes)),
+            );
             if c < best.1 {
                 best = (b, c);
             }
@@ -1337,7 +1504,7 @@ impl LocalRegAlloc<'_> {
                     // Try to choose from the vector based on our offset from
                     // the representative.
                     if let Some(bytes) =
-                        self.ssa_bytes_offset(vec_repr, a.vec_offset.into())
+                        self.repr_bytes_offset(vec_repr, a.vec_offset.into())
                     {
                         if self.is_aligned_unpinned_range(
                             p,
@@ -1474,13 +1641,36 @@ impl LocalRegAlloc<'_> {
         vec: &SSARef,
         bytes: u8,
         align: RegAlignConstraint,
+        avoid: &BitSet<usize>,
     ) -> Range<u16> {
         let ssa_bytes = vec.bytes();
         let p = &self.pinned_out;
+        let overlap = |b: u16, n: u16| -> u8 {
+            if !self.arena.live_src {
+                return 0;
+            }
+            avoid
+                .count_set_in_range(usize::from(b)..usize::from(b + n))
+                .try_into()
+                .unwrap_or(u8::MAX)
+        };
+
+        if let Some(value) = self.dst_const.filter(|_| self.arena.const_pref) {
+            let free = vec.comps() > 1 || {
+                let a = self.affinities.get_ssa(vec[0]);
+                a.vec_size == 0 && a.reg_byte().is_none()
+            };
+            if free && bytes == ssa_bytes {
+                if let Some(b) = self.find_const_bytes(p, bytes, align, value) {
+                    return b..(b + u16::from(bytes));
+                }
+            }
+        }
 
         if let Some(phi_bytes) = self.ssa_ref_phi_bytes(vec) {
             if self.is_aligned_unpinned_range(p, phi_bytes.clone(), align)
                 && self.bytes_are_unused(phi_bytes.clone())
+                && overlap(phi_bytes.start, phi_bytes.end - phi_bytes.start) == 0
             {
                 debug_assert_eq!(phi_bytes.len(), usize::from(ssa_bytes));
                 return phi_bytes;
@@ -1492,14 +1682,18 @@ impl LocalRegAlloc<'_> {
             self.choose_ssa_ref_bytes(p, vec, align, |b| {
                 let bytes = aligned_u16_range(b, bytes.into());
                 debug_assert!(b + u16::from(ssa_bytes) <= bytes.end);
-                self.used
+                let used: u8 = self
+                    .used
                     .count_set_in_range(bytes.start.into()..bytes.end.into())
                     .try_into()
-                    .unwrap_or(u8::MAX)
+                    .unwrap_or(u8::MAX);
+                used.saturating_add(overlap(bytes.start, bytes.end - bytes.start))
             })
         } else {
             debug_assert_eq!(ssa_bytes, bytes);
-            self.choose_ssa_ref_bytes(p, vec, align, |_| 0)
+            self.choose_ssa_ref_bytes(p, vec, align, |b| {
+                overlap(b, u16::from(bytes))
+            })
         }
     }
 
@@ -1511,13 +1705,13 @@ impl LocalRegAlloc<'_> {
         bl: &BlockLiveness,
     ) {
         // We use a bitmask for indices
-        assert!(instr.srcs().len() <= 8);
+        assert!(instr.srcs().len() <= 32);
         assert!(instr.dsts().len() <= 8);
 
         struct SrcDst {
             is_src: bool,
             is_killed: bool,
-            mask: u8,
+            mask: u32,
             bytes: u8,
             align: RegAlignConstraint,
             fixed_reg: Option<RegRef>,
@@ -1535,7 +1729,9 @@ impl LocalRegAlloc<'_> {
         }
 
         let early_clobber = instr.op.dst_is_early_clobber();
+        self.dst_const = copy_const_value(instr);
         let mut src_bytes = BitSet::new();
+        let mut live_src_bytes = BitSet::new();
         let mut evicted = VecDeque::new();
         let mut srcs_dsts: Vec<SrcDst> = Vec::new();
         for (i, src) in instr.srcs().iter().enumerate() {
@@ -1586,6 +1782,11 @@ impl LocalRegAlloc<'_> {
                     src_bytes.set_range(
                         ssa_bytes.start.into()..ssa_bytes.end.into(),
                     );
+                    if bl.is_live_after_ip(ssa, ip) {
+                        live_src_bytes.set_range(
+                            ssa_bytes.start.into()..ssa_bytes.end.into(),
+                        );
+                    }
                     evicted.push_back(Evicted {
                         is_src: true,
                         bytes: ssa_bytes.clone(),
@@ -1655,10 +1856,10 @@ impl LocalRegAlloc<'_> {
                     }
                 }
 
-                // We don't allow clobbers with destinations.  Mark them in
-                // pinned_in_out to ensure that no sources we need preserved
-                // get assigned to clobbered regs.
-                debug_assert!(instr.dsts().is_empty());
+                debug_assert!(instr.dsts().iter().all(|dst| {
+                    dst.dst_ref.is_none()
+                        || self.model.op_fixed_dst_reg(&instr.op, dst).is_some()
+                }));
                 self.pinned_in_out.pin_bytes_no_check(bytes);
             }
         }
@@ -1695,6 +1896,7 @@ impl LocalRegAlloc<'_> {
                     &src_dst.vec,
                     src_dst.bytes,
                     src_dst.align,
+                    &live_src_bytes,
                 )
             };
             debug_assert_eq!(ssa_bytes.len(), usize::from(src_dst.vec.bytes()));
@@ -1795,14 +1997,6 @@ impl LocalRegAlloc<'_> {
                         src.swizzle = swz
                             .swizzle(src.swizzle)
                             .expect("8 and 16-bit sources have to swizzle");
-
-                        // If all the SSA values read by this source are killed,
-                        // mark this as the last use.  Only do this if the SSA
-                        // values in question consume whole registers because
-                        // the hardware's last-use concept is per-register, not
-                        // per-byte.
-                        let whole_regs = src_dst.vec[0].bits() == 32;
-                        src.last_use = src_dst.is_killed && whole_regs;
                     } else {
                         assert_eq!(src.swizzle, ra_src.swizzle);
                         instr.srcs_mut()[i].src_ref = ra_src.src_ref;
@@ -1828,6 +2022,31 @@ impl LocalRegAlloc<'_> {
         }
 
         while let Some(e) = evicted.pop_front() {
+            if self.arena.rt_call_placement && !e.is_src
+                && e.bytes.len() == 4 && e.bytes.start % 8 == 0
+            {
+                if let Some(mate) = evicted.iter().position(|other| {
+                    !other.is_src && other.bytes.len() == 4
+                        && other.bytes.start == e.bytes.end
+                }) {
+                    let dst = self.find_aligned_unused_unpinned_range(
+                        &self.pinned_in_out, 0, 8, 8, 0,
+                    );
+                    if dst + 8 <= usize::from(self.arena.limit()) {
+                        let dst = u16::try_from(dst).unwrap();
+                        let mate = evicted.remove(mate).unwrap();
+                        self.pinned_in_out.pin_bytes(dst..dst + 8);
+                        self.assign_idx_bytes(e.idx, dst..dst + 4);
+                        self.assign_idx_bytes(mate.idx, dst + 4..dst + 8);
+                        pcopy.add_copy(
+                            self.arena.dst_for_bytes(dst..dst + 8),
+                            self.arena.src_for_bytes(e.bytes.start..mate.bytes.end),
+                        );
+                        self.search_start.set(dst + 8);
+                        continue;
+                    }
+                }
+            }
             let dst_bytes = if e.is_src {
                 // If it's a source, it's already been placed.  Just look it up.
                 let idx_bytes = self.idx_bytes(e.idx);
@@ -1870,6 +2089,7 @@ impl LocalRegAlloc<'_> {
         self.pinned_in.clear();
         self.pinned_out.clear();
         self.pinned_in_out.clear();
+        self.dst_const = None;
     }
 
     fn try_coalesce_mkvec(
@@ -1967,6 +2187,8 @@ struct GlobalRegAlloc<'a> {
 
     /// Pinned byte set for cross-block allocation
     pinned: PinnedByteSet,
+
+    block_const: Vec<Option<FxHashMap<u8, u32>>>,
 }
 
 impl GlobalRegAlloc<'_> {
@@ -1979,10 +2201,16 @@ impl GlobalRegAlloc<'_> {
             local: LocalRegAlloc::new(model, arena, affinities),
             live_out: Default::default(),
             pinned: Default::default(),
+            block_const: Default::default(),
         }
     }
 
-    fn start_shader(&mut self, cfg: &CFG<BasicBlock>) {
+    fn start_shader(
+        &mut self,
+        cfg: &CFG<BasicBlock>,
+        live: &Liveness,
+        pcopy: &mut ParallelCopy,
+    ) {
         debug_assert!(self.local.used.is_empty());
 
         let bi = 0;
@@ -2002,6 +2230,68 @@ impl GlobalRegAlloc<'_> {
                         break;
                     }
                 }
+            }
+        }
+
+        if !self.local.arena.rt_call_placement {
+            return;
+        }
+
+        let calls: Vec<_> = cfg.iter().enumerate().flat_map(|(bi, block)| {
+            block.instrs.iter().enumerate().filter_map(move |(ip, instr)| {
+                matches!(instr.op, Op::RtCall(_)).then_some((bi, ip))
+            })
+        }).collect();
+        if calls.is_empty() {
+            return;
+        }
+
+        let mut inputs = Vec::new();
+        for instr in &cfg[0].instrs {
+            if let Op::RegIn(op) = &instr.op {
+                for ssa in op.dst.dst_ref.as_ssa().unwrap() {
+                    let bytes = self.local.ssa_bytes(ssa);
+                    if bytes.end <= 20 * 4
+                        && calls.iter().any(|&(bi, ip)| {
+                            live.block(bi).is_live_after_ip(ssa, ip)
+                        })
+                    {
+                        inputs.push((*ssa, bytes));
+                    }
+                }
+            }
+        }
+        inputs.sort_by_key(|(_, bytes)| bytes.start);
+        let mut i = 0;
+        while i < inputs.len() {
+            let start = i;
+            i += 1;
+            while i < inputs.len()
+                && inputs[i - 1].1.end == inputs[i].1.start
+            {
+                i += 1;
+            }
+            let src = inputs[start].1.start..inputs[i - 1].1.end;
+            let size = src.end - src.start;
+            let Some(dst) = (20 * 4..self.local.arena.limit())
+                .step_by(4)
+                .find(|&b| {
+                    b % 8 == src.start % 8
+                        && b + size <= self.local.arena.limit()
+                        && self.local.bytes_are_unused(b..b + size)
+                })
+            else {
+                continue;
+            };
+            for (ssa, bytes) in &inputs[start..i] {
+                let first = dst + bytes.start - src.start;
+                let target = first..first + u16::from(ssa.bytes());
+                self.local.free_bytes(bytes.clone());
+                self.local.assign_ssa_bytes(ssa, target.clone());
+                pcopy.add_copy(
+                    self.local.arena.reg_for_bytes(target).into(),
+                    self.local.arena.reg_for_bytes(bytes.clone()).into(),
+                );
             }
         }
     }
@@ -2416,14 +2706,40 @@ impl GlobalRegAlloc<'_> {
         bi: usize,
         phi_map: &PhiMap,
     ) {
+        let mut entry_copy =
+            ParallelCopy::new(self.local.model, self.local.arena.is_mem());
         if bi == 0 {
-            self.start_shader(cfg);
+            self.start_shader(cfg, live, &mut entry_copy);
         } else {
             self.start_block(cfg, live, ssa_alloc, bi);
         }
 
+        self.local.reg_const.clear();
+        if self.block_const.len() < cfg.len() {
+            self.block_const.resize_with(cfg.len(), Default::default);
+        }
+        let mut seeded: Option<FxHashMap<u8, u32>> = None;
+        for &pi in cfg.pred_indices(bi) {
+            let Some(Some(pred)) = (pi < bi).then(|| self.block_const[pi].as_ref())
+            else {
+                seeded = Some(Default::default());
+                break;
+            };
+            seeded = Some(match seeded {
+                None => pred.clone(),
+                Some(mut cur) => {
+                    cur.retain(|k, v| pred.get(k) == Some(v));
+                    cur
+                }
+            });
+        }
+        if let Some(seed) = seeded {
+            self.local.reg_const = seed;
+        }
         let bl = live.block(bi);
-        let mut instrs = Vec::new();
+        let mut pcopy_alloc = self.pcopy_alloc(ssa_alloc);
+        let mut instrs: Vec<Instr> =
+            entry_copy.into_instrs(pcopy_alloc.as_mut()).collect();
         let mut phi_srcs = Vec::new();
         let mut reg_outs = Vec::new();
         let mut branch = None;
@@ -2477,8 +2793,15 @@ impl GlobalRegAlloc<'_> {
             let mut pcopy =
                 ParallelCopy::new(self.local.model, self.local.arena.is_mem());
             self.local.alloc_regs_instr(ip, &mut instr, &mut pcopy, bl);
+            pcopy.set_scratch_from_instr(&instr);
             let mut pcopy_alloc = self.pcopy_alloc(ssa_alloc);
-            instrs.extend(pcopy.into_instrs(pcopy_alloc.as_mut()));
+            let copies: Vec<Instr> =
+                pcopy.into_instrs(pcopy_alloc.as_mut()).collect();
+            for copy in &copies {
+                self.local.note_reg_writes(copy);
+            }
+            self.local.note_reg_writes(&instr);
+            instrs.extend(copies);
             instrs.push(instr);
         }
 
@@ -2506,9 +2829,15 @@ impl GlobalRegAlloc<'_> {
                 &mut pcopy,
             );
             let mut pcopy_alloc = self.pcopy_alloc(ssa_alloc);
-            instrs.extend(pcopy.into_instrs(pcopy_alloc.as_mut()));
+            let copies: Vec<Instr> =
+                pcopy.into_instrs(pcopy_alloc.as_mut()).collect();
+            for copy in &copies {
+                self.local.note_reg_writes(copy);
+            }
+            instrs.extend(copies);
             instrs.extend(phi_srcs.into_iter().map(Instr::from));
             instrs.extend(branch.map(Instr::from));
+            self.block_const[bi] = Some(self.local.reg_const.clone());
         }
 
         cfg[bi].instrs = instrs;
@@ -2639,7 +2968,33 @@ impl Shader<'_> {
         });
     }
 
-    pub fn assign_registers(&mut self) {
+    fn remove_undefs(&mut self) {
+        for block in self.blocks.iter_mut() {
+            block.instrs.retain(|instr| !matches!(instr.op, Op::Undef(_)));
+        }
+    }
+
+    fn reg_limit(&self) -> u16 {
+        if DEBUG.contains(DebugFlags::SPILL) {
+            16 * 4
+        } else {
+            u16::from(self.model.max_reg_count()) * 4
+        }
+    }
+
+    pub fn needs_spilling(&self) -> bool {
+        !self.info.is_blend
+            && Liveness::for_shader(self).max_live_bytes().reg
+                > u32::from(self.reg_limit())
+    }
+
+    pub fn assign_registers(
+        &mut self,
+        loop_exit_distance: usize,
+        const_pref: bool,
+        anti_frag: bool,
+        live_src: bool,
+    ) {
         let tls_base = self.info.tls_size;
         pass!(self.lower_repeated_phi_srcs());
 
@@ -2658,24 +3013,29 @@ impl Shader<'_> {
                 alloc_regs(s, &arena, live);
             });
             self.info.registers_used = arena.regs_used();
+            self.remove_undefs();
             return;
         }
 
-        let mut reg_limit: u16 = if DEBUG.contains(DebugFlags::SPILL) {
-            16 * 4
-        } else {
-            u16::from(self.model.max_reg_count()) * 4
-        };
+        let mut reg_limit = self.reg_limit();
 
         let mut live = Liveness::for_shader(self);
         let max_live = live.max_live_bytes();
         assert_eq!(max_live.mem, 0);
+        let native = self.model.arch() >= 15 && self.blocks.iter().any(|b| {
+            b.instrs.iter().any(|i| matches!(&i.op, Op::RtReturn(_)))
+        });
+        self.info.rt_frame_tls = native &&
+            (self.info.tls_size != 0 || max_live.reg > u32::from(reg_limit));
+        if self.info.rt_frame_tls {
+            reg_limit -= 8;
+        }
         if max_live.reg > u32::from(reg_limit) {
             // If we spill, we have to reduce registers by 2 to make room for
             // parallel copying memory
             reg_limit -= 8;
 
-            self.spill_values(live, reg_limit.into());
+            self.spill_values(live, reg_limit.into(), loop_exit_distance);
             if DEBUG.contains(DebugFlags::PRINT) {
                 eprintln!("Kraid shader after spill_values:\n{self}");
             }
@@ -2707,15 +3067,79 @@ impl Shader<'_> {
             live = Liveness::for_shader(self)
         }
 
-        let live_reg_bytes = max_live.reg.try_into().unwrap();
-        let reg_arena = Arena::new_reg(self.model, live_reg_bytes);
+        let mut live_reg_bytes: u16 = max_live.reg.try_into().unwrap();
+        if self.model.arch() >= 15 {
+            for instr in self.blocks.iter().flat_map(|b| &b.instrs) {
+                let reg = match &instr.op {
+                    Op::RegIn(op) => Some(op.reg),
+                    Op::RegOut(op) => Some(op.reg),
+                    _ => None,
+                };
+                for reg in reg.into_iter()
+                    .chain(instr.srcs().iter().filter_map(|src|
+                        self.model.op_fixed_src_reg(&instr.op, src)))
+                    .chain(instr.dsts().iter().filter_map(|dst|
+                        self.model.op_fixed_dst_reg(&instr.op, dst)))
+                {
+                    live_reg_bytes = live_reg_bytes.max(reg.byte_range().end);
+                }
+            }
+        }
+        let mut reg_arena = Arena::new_reg(self.model, live_reg_bytes);
+        reg_arena.rt_frame_tls = self.info.rt_frame_tls;
+        if reg_arena.rt_frame_tls {
+            reg_arena.limit = reg_arena.limit.min(self.reg_limit() - 8);
+        }
+        reg_arena.const_pref = const_pref;
+        reg_arena.anti_frag = anti_frag;
+        reg_arena.live_src = live_src;
+        reg_arena.rt_call_placement = anti_frag && self.model.arch() >= 15
+            && self.blocks.iter().any(|b| {
+                b.instrs.iter().any(|i| {
+                    matches!(&i.op, Op::RtReturn(ret) if !ret.root)
+                })
+            })
+            && self.blocks.iter().any(|b| {
+                b.instrs.iter().any(|i| matches!(i.op, Op::RtCall(_)))
+            });
         self.run_pass("allocating registers", |s| {
             alloc_regs(s, &reg_arena, live);
         });
         self.info.registers_used = reg_arena.regs_used();
+        if self.info.rt_frame_tls {
+            self.info.registers_used = self.info.registers_used.min(126);
+        }
         pass!(self.unspill(tls_base));
+        self.remove_undefs();
+        if self.info.rt_frame_tls {
+            for instr in self.blocks.iter_mut().flat_map(|b| &mut b.instrs) {
+                let remap = |reg: &mut RegRef| {
+                    assert!(reg.idx >= 20 || reg.reg_range().end <= 20);
+                    if reg.idx >= 20 {
+                        assert!(reg.reg_range().end <= 126);
+                        reg.idx += 2;
+                    }
+                };
+                for src in instr.srcs_mut() {
+                    if let SrcRef::Reg(reg) = &mut src.src_ref {
+                        remap(reg);
+                    }
+                }
+                for dst in instr.dsts_mut() {
+                    if let DstRef::Reg(reg) = &mut dst.dst_ref {
+                        remap(reg);
+                    }
+                }
+            }
+            self.info.registers_used = (self.info.registers_used.max(20) + 2)
+                .next_multiple_of(16);
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "ra_rt_tests.rs"]
+mod rt_tests;
 
 #[cfg(test)]
 mod tests {

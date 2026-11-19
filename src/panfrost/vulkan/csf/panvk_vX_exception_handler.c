@@ -66,6 +66,11 @@ copy_fbd(struct cs_builder *b, bool has_zs_ext, uint32_t rt_count,
    cs_store(b, cs_scratch_reg_tuple(b, 0, 2), dst, BITFIELD_MASK(2),
             8 * sizeof(uint32_t));
 
+   cs_load_to(b, cs_scratch_reg_tuple(b, 0, 2), src_other, BITFIELD_MASK(2),
+              offsetof(struct panvk_fb_layer_state, vrs_image));
+   cs_store(b, cs_scratch_reg_tuple(b, 0, 2), dst, BITFIELD_MASK(2),
+            offsetof(struct panvk_fb_layer_state, vrs_image));
+
    if (has_zs_ext)
       cs_add_imm64(b, cs_scratch_reg64(b, 0), dst, dbd_offset);
    else

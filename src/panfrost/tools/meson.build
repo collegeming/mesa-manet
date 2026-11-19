@@ -40,6 +40,7 @@ if with_kraidoc
     'kraidoc_common',
     files('../vulkan/panvk_nir_lower_cooperative_matrix.c',
           '../vulkan/panvk_nir_lower_tile_image.c',
+          '../lib/pan_blend.c',
           '../lib/pan_earlyzs.c'),
     include_directories : [inc_include, inc_src, inc_panfrost,
                            include_directories('../vulkan')],
@@ -48,16 +49,28 @@ if with_kraidoc
     c_args : [c_msvc_compat_args, no_override_init_args, soong_compat_c_args,
               '-DPANVK_OFFLINE_ONLY'],
   )
+  kraidoc_compat_inc = []
+  if host_machine.system() == 'windows'
+    kraidoc_compat_inc = include_directories('compat')
+  endif
   kraidoc_arch_libs = []
-  foreach arch : [9, 10, 11]
+  foreach arch : [9, 10, 11, 15]
+    kraidoc_arch_files = files(
+      '../vulkan/panvk_vX_shader.c',
+      '../vulkan/panvk_vX_blend_state.c',
+      '../lib/pan_format.c',
+      '../vulkan/panvk_vX_descriptor_set_layout.c',
+      '../vulkan/panvk_vX_nir_lower_descriptors.c',
+      '../vulkan/panvk_vX_nir_lower_input_attachment_loads.c')
+    if arch >= 15
+      kraidoc_arch_files += files('../vulkan/panvk_vX_nir_lower_ray_queries.c')
+    endif
     kraidoc_arch_libs += static_library(
       'kraidoc_v@0@'.format(arch),
-      files('../vulkan/panvk_vX_shader.c',
-            '../vulkan/panvk_vX_descriptor_set_layout.c',
-            '../vulkan/panvk_vX_nir_lower_descriptors.c',
-            '../vulkan/panvk_vX_nir_lower_input_attachment_loads.c'),
+      kraidoc_arch_files,
       include_directories : [inc_include, inc_src, inc_panfrost,
-                             include_directories('../vulkan')],
+                             include_directories('../vulkan'),
+                             kraidoc_compat_inc],
       dependencies : [idep_nir_headers, idep_pan_packers, idep_mesautil,
                       idep_vulkan_util_headers, idep_vulkan_runtime_headers],
       c_args : [c_msvc_compat_args, no_override_init_args, soong_compat_c_args,

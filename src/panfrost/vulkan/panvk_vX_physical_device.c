@@ -19,6 +19,7 @@
 #include "vk_limits.h"
 #include "vk_shader_module.h"
 
+#include "panvk_bc_emu.h"
 #include "panvk_instance.h"
 #include "panvk_buffer.h"
 #include "panvk_cmd_draw.h"
@@ -76,6 +77,9 @@ panvk_per_arch(get_physical_device_extensions)(
    bool has_gralloc = vk_android_get_ugralloc() != NULL;
 
    *ext = (struct vk_device_extension_table){
+      .MTK_dynamic_cache_memory = PAN_ARCH == 15 &&
+         device->kbase_node_path[0] && sizeof(void *) == 8 &&
+         access("/dev/gpu_pdma", R_OK | W_OK) == 0,
       .KHR_8bit_storage = true,
       .KHR_16bit_storage = true,
       .KHR_acceleration_structure = PAN_ARCH >= 15,
@@ -107,6 +111,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_external_semaphore = true,
       .KHR_external_semaphore_fd = true,
       .KHR_format_feature_flags2 = true,
+      .KHR_fragment_shading_rate = PAN_ARCH >= 14,
       .KHR_get_memory_requirements2 = true,
       .KHR_global_priority = true,
       .KHR_image_format_list = true,
@@ -132,9 +137,14 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_pipeline_library = true,
       .KHR_push_descriptor = true,
       .KHR_ray_query = PAN_ARCH >= 15,
+      .KHR_ray_tracing_position_fetch = PAN_ARCH >= 15,
+      .EXT_opacity_micromap = PAN_ARCH >= 15,
+      .ARM_pipeline_opacity_micromap = PAN_ARCH >= 15,
       .KHR_ray_tracing_pipeline = PAN_ARCH >= 15 &&
          pan_use_kraid(PAN_ARCH, MESA_SHADER_COMPUTE, false),
       .KHR_ray_tracing_maintenance1 = PAN_ARCH >= 15 &&
+         pan_use_kraid(PAN_ARCH, MESA_SHADER_COMPUTE, false),
+      .EXT_pipeline_library_group_handles = PAN_ARCH >= 15 &&
          pan_use_kraid(PAN_ARCH, MESA_SHADER_COMPUTE, false),
       .KHR_relaxed_block_layout = true,
       .KHR_robustness2 = PAN_ARCH >= 10,
@@ -256,12 +266,14 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_shader_float8 = PAN_ARCH >= 15,
       .EXT_shader_image_atomic_int64 = PAN_ARCH >= 9,
       .EXT_shader_module_identifier = true,
+      .EXT_shader_object = PAN_ARCH >= 10,
       .EXT_shader_replicated_composites = true,
       .EXT_shader_stencil_export = true,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
       .EXT_shader_tile_image = PAN_ARCH >= 9,
       .EXT_shader_uniform_buffer_unsized_array = true,
+      .EXT_shader_viewport_index_layer = PAN_ARCH >= 10,
       .EXT_subgroup_size_control = true,
 #ifdef PANVK_USE_WSI_PLATFORM
       .EXT_swapchain_maintenance1 = true,
@@ -297,6 +309,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .ARM_performance_counters_by_region = PAN_ARCH >= 15,
       .ARM_tensors = has_tensors(),
       .ARM_tensor_controls = has_tensors(),
+      .ARM_data_graph = has_tensors() && debug_get_bool_option("PANVK_DATA_GRAPH", false),
    };
 }
 
@@ -335,6 +348,9 @@ has_texture_compression_astc_hdr(const struct panvk_physical_device *physical_de
 static bool
 has_texture_compression_bc(const struct panvk_physical_device *physical_device)
 {
+   if (panvk_bc_emulation(physical_device))
+      return true;
+
    return has_compressed_formats(physical_device,
       BITFIELD_BIT(MALI_BC1_UNORM) | BITFIELD_BIT(MALI_BC2_UNORM) |
       BITFIELD_BIT(MALI_BC3_UNORM) | BITFIELD_BIT(MALI_BC4_UNORM) |
@@ -364,7 +380,7 @@ panvk_per_arch(get_physical_device_features)(
       .fullDrawIndexUint32 = true,
       .imageCubeArray = true,
       .independentBlend = true,
-      .geometryShader = false,
+      .geometryShader = PAN_ARCH >= 10,
       .tessellationShader = true,
       .sampleRateShading = true,
       .dualSrcBlend = true,
@@ -385,7 +401,7 @@ panvk_per_arch(get_physical_device_features)(
       .wideLines = true,
       .largePoints = true,
       .alphaToOne = false,
-      .multiViewport = false,
+      .multiViewport = PAN_ARCH >= 10,
       .samplerAnisotropy = true,
       .textureCompressionETC2 = has_texture_compression_etc2(device),
       .textureCompressionASTC_LDR = has_texture_compression_astc_ldr(device),
@@ -408,8 +424,8 @@ panvk_per_arch(get_physical_device_features)(
       .shaderSampledImageArrayDynamicIndexing = true,
       .shaderStorageBufferArrayDynamicIndexing = true,
       .shaderStorageImageArrayDynamicIndexing = true,
-      .shaderClipDistance = false,
-      .shaderCullDistance = false,
+      .shaderClipDistance = PAN_ARCH >= 10,
+      .shaderCullDistance = PAN_ARCH >= 10,
       .shaderFloat64 = false,
       .shaderInt64 = true,
       .shaderInt16 = true,
@@ -486,12 +502,14 @@ panvk_per_arch(get_physical_device_features)(
       .bufferDeviceAddress = true,
       /* only expose for CSF/panthor, and if we have extended VA ranges */
       .bufferDeviceAddressCaptureReplay =
-         (PAN_ARCH >= 10) && (device->memory.max_supported_va > (1ull << 32)),
+         (PAN_ARCH >= 10) && (device->memory.max_supported_va > (1ull << 32)) &&
+         (!device->kmod.dev->ops->bo_alloc_at ||
+          (device->kmod.dev->props.supported_bo_flags & PAN_KMOD_BO_FLAG_CAPTURE_REPLAY)),
       .bufferDeviceAddressMultiDevice = false,
       .vulkanMemoryModel = true,
       .vulkanMemoryModelDeviceScope = true,
       .vulkanMemoryModelAvailabilityVisibilityChains = true,
-      .shaderOutputViewportIndex = false,
+      .shaderOutputViewportIndex = PAN_ARCH >= 10,
       .shaderOutputLayer = PAN_ARCH >= 10,
       .subgroupBroadcastDynamicId = true,
 
@@ -543,15 +561,27 @@ panvk_per_arch(get_physical_device_features)(
       .depthClampZeroOne = true,
 
       .accelerationStructure = PAN_ARCH >= 15,
-      .accelerationStructureCaptureReplay = false,
-      .accelerationStructureIndirectBuild = false,
+      .accelerationStructureCaptureReplay = PAN_ARCH >= 15 &&
+         (!device->kmod.dev->ops->bo_alloc_at ||
+          (device->kmod.dev->props.supported_bo_flags & PAN_KMOD_BO_FLAG_CAPTURE_REPLAY)),
+      .accelerationStructureIndirectBuild = PAN_ARCH >= 15,
       .accelerationStructureHostCommands = false,
+      .micromapEXT = PAN_ARCH >= 15,
+      .micromapCaptureReplay = PAN_ARCH >= 15 &&
+         (!device->kmod.dev->ops->bo_alloc_at ||
+          (device->kmod.dev->props.supported_bo_flags & PAN_KMOD_BO_FLAG_CAPTURE_REPLAY)),
+      .micromapHostCommands = false,
+      .pipelineOpacityMicromap = PAN_ARCH >= 15,
       .descriptorBindingAccelerationStructureUpdateAfterBind = PAN_ARCH >= 15,
 
       .rayQuery = PAN_ARCH >= 15,
+      .rayTracingPositionFetch = PAN_ARCH >= 15,
+      .pipelineLibraryGroupHandles = PAN_ARCH >= 15 &&
+         pan_use_kraid(PAN_ARCH, MESA_SHADER_COMPUTE, false),
       .rayTracingPipeline = PAN_ARCH >= 15 &&
          pan_use_kraid(PAN_ARCH, MESA_SHADER_COMPUTE, false),
-      .rayTracingPipelineShaderGroupHandleCaptureReplay = false,
+      .rayTracingPipelineShaderGroupHandleCaptureReplay = PAN_ARCH >= 15 &&
+         pan_use_kraid(PAN_ARCH, MESA_SHADER_COMPUTE, false),
       .rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false,
       .rayTracingPipelineTraceRaysIndirect = PAN_ARCH >= 15 &&
          pan_use_kraid(PAN_ARCH, MESA_SHADER_COMPUTE, false),
@@ -733,6 +763,9 @@ panvk_per_arch(get_physical_device_features)(
       .shaderStorageTensorArrayNonUniformIndexing = false,
       .descriptorBindingStorageTensorUpdateAfterBind = false,
       .tensors = has_tensors(),
+      .dataGraph = has_tensors() && debug_get_bool_option("PANVK_DATA_GRAPH", false),
+      .dataGraphSpecializationConstants = has_tensors() && debug_get_bool_option("PANVK_DATA_GRAPH", false),
+      .dataGraphShaderModule = has_tensors() && debug_get_bool_option("PANVK_DATA_GRAPH", false),
 
       /* VK_EXT_shader_tile_image */
       .shaderTileImageColorReadAccess = PAN_ARCH >= 9,
@@ -755,6 +788,10 @@ panvk_per_arch(get_physical_device_features)(
       /* VK_KHR_shader_maximal_reconvergence */
       .shaderMaximalReconvergence = true,
 
+      .pipelineFragmentShadingRate = PAN_ARCH >= 14,
+      .primitiveFragmentShadingRate = PAN_ARCH >= 14,
+      .attachmentFragmentShadingRate = PAN_ARCH >= 14,
+
       /* VK_KHR_shader_subgroup_uniform_control_flow */
       .shaderSubgroupUniformControlFlow = true,
 
@@ -769,6 +806,7 @@ panvk_per_arch(get_physical_device_features)(
 
       /* VK_EXT_shader_module_identifier */
       .shaderModuleIdentifier = true,
+      .shaderObject = PAN_ARCH >= 10,
 
       /* VK_EXT_shader_replicated_composites */
       .shaderReplicatedComposites = true,
@@ -985,7 +1023,7 @@ panvk_per_arch(get_physical_device_properties)(
       .maxImageDimension2D = (1 << 16),
       .maxImageDimension3D = (1 << 16),
       .maxImageDimensionCube = (1 << 16),
-      .maxImageArrayLayers = (1 << 16),
+      .maxImageArrayLayers = 4096,
       .maxTexelBufferElements = UINT64_C(1) << (util_logbase2(panvk_get_max_buffer_size(device) / 16)),
       /* Each uniform entry is 16-byte and the number of entries is encoded in a
        * 12-bit field, with the minus(1) modifier, which gives 2^20.
@@ -1060,11 +1098,11 @@ panvk_per_arch(get_physical_device_properties)(
       .maxTessellationEvaluationInputComponents = 128,
       .maxTessellationEvaluationOutputComponents = 128,
       /* Geometry shaders not supported. */
-      .maxGeometryShaderInvocations = 0,
-      .maxGeometryInputComponents = 0,
-      .maxGeometryOutputComponents = 0,
-      .maxGeometryOutputVertices = 0,
-      .maxGeometryTotalOutputComponents = 0,
+      .maxGeometryShaderInvocations = PAN_ARCH >= 10 ? 32 : 0,
+      .maxGeometryInputComponents = PAN_ARCH >= 10 ? 128 : 0,
+      .maxGeometryOutputComponents = PAN_ARCH >= 10 ? 128 : 0,
+      .maxGeometryOutputVertices = PAN_ARCH >= 10 ? 256 : 0,
+      .maxGeometryTotalOutputComponents = PAN_ARCH >= 10 ? 1024 : 0,
       /* 32 vec4 varyings. */
       .maxFragmentInputComponents = 128,
       /* 8 render targets. */
@@ -1099,7 +1137,7 @@ panvk_per_arch(get_physical_device_properties)(
       .maxDrawIndirectCount = PAN_ARCH >= 10 ? UINT32_MAX : 1,
       .maxSamplerLodBias = (float)INT16_MAX / 256.0f,
       .maxSamplerAnisotropy = 16,
-      .maxViewports = 1,
+      .maxViewports = PAN_ARCH >= 10 ? 16 : 1,
       .maxViewportDimensions = {MAX_FRAMEBUFFER_DIMENSION, MAX_FRAMEBUFFER_DIMENSION},
       .viewportBoundsRange = {-2.0f * MAX_FRAMEBUFFER_DIMENSION, 2.0f * MAX_FRAMEBUFFER_DIMENSION - 1.0f},
       .viewportSubPixelBits = 0,
@@ -1137,9 +1175,9 @@ panvk_per_arch(get_physical_device_properties)(
          PAN_ARCH >= 10 && device->kmod.dev->props.gpu_can_query_timestamp,
       .timestampPeriod =
          PAN_ARCH >= 10 ? panvk_get_gpu_system_timestamp_period(device) : 0,
-      .maxClipDistances = 0,
-      .maxCullDistances = 0,
-      .maxCombinedClipAndCullDistances = 0,
+      .maxClipDistances = PAN_ARCH >= 10 ? 8 : 0,
+      .maxCullDistances = PAN_ARCH >= 10 ? 8 : 0,
+      .maxCombinedClipAndCullDistances = PAN_ARCH >= 10 ? 8 : 0,
       .discreteQueuePriorities = 2,
       .pointSizeRange = {pointSizeRangeMin, pointSizeRangeMax},
       .lineWidthRange = {0.0, 7.9921875},
@@ -1342,8 +1380,7 @@ panvk_per_arch(get_physical_device_properties)(
       .nonStrictWideLinesUseParallelogram = false,
       .blockTexelViewCompatibleMultipleLayers = true,
       .maxCombinedImageSamplerDescriptorCount = 1,
-      /* We don't implement VK_KHR_fragment_shading_rate */
-      .fragmentShadingRateClampCombinerInputs = false,
+      .fragmentShadingRateClampCombinerInputs = PAN_ARCH >= 14,
       .defaultRobustnessStorageBuffers =
          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS_EXT,
       .defaultRobustnessUniformBuffers =
@@ -1395,7 +1432,6 @@ panvk_per_arch(get_physical_device_properties)(
       .shaderBinaryVersion = 0,
 
       /* VK_KHR_maintenance7 */
-      /* We don't implement VK_KHR_fragment_shading_rate */
       .robustFragmentShadingRateAttachmentAccess = false,
       .separateDepthStencilAttachmentAccess = false,
       .maxDescriptorSetTotalUniformBuffersDynamic = MAX_DYNAMIC_UNIFORM_BUFFERS,
@@ -1433,24 +1469,44 @@ panvk_per_arch(get_physical_device_properties)(
       .maxInstanceCount = (1 << 24) - 1,
       .maxPrimitiveCount = (1 << 29) - 1,
       .maxPerStageDescriptorAccelerationStructures =
-         MAX_PER_STAGE_STORAGE_BUFFERS,
+         8388608,
       .maxPerStageDescriptorUpdateAfterBindAccelerationStructures =
-         MAX_PER_STAGE_STORAGE_BUFFERS,
-      .maxDescriptorSetAccelerationStructures = MAX_PER_SET_STORAGE_BUFFERS,
+         8388608,
+      .maxDescriptorSetAccelerationStructures = 8388608,
       .shaderGroupHandleSize = 32,
       .maxRayRecursionDepth = 32,
       .maxShaderGroupStride = 4096,
       .shaderGroupBaseAlignment = 64,
-      .shaderGroupHandleCaptureReplaySize = 0,
+      .shaderGroupHandleCaptureReplaySize = 64,
       .maxRayDispatchInvocationCount = 1u << 30,
       .shaderGroupHandleAlignment = 32,
       .maxRayHitAttributeSize = 32,
       .maxDescriptorSetUpdateAfterBindAccelerationStructures =
-         MAX_PER_SET_STORAGE_BUFFERS,
-      .minAccelerationStructureScratchOffsetAlignment = 128,
+         8388608,
+      .minAccelerationStructureScratchOffsetAlignment = 64,
+      .maxOpacity2StateSubdivisionLevel = 10,
+      .maxOpacity4StateSubdivisionLevel = 10,
 
       /* VK_EXT_custom_border_color */
       .maxCustomBorderColorSamplers = 32768,
+
+      .minFragmentShadingRateAttachmentTexelSize = {8, 8},
+      .maxFragmentShadingRateAttachmentTexelSize = {32, 32},
+      .maxFragmentShadingRateAttachmentTexelSizeAspectRatio = 1,
+      .primitiveFragmentShadingRateWithMultipleViewports = false,
+      .layeredShadingRateAttachments = PAN_ARCH >= 14,
+      .fragmentShadingRateNonTrivialCombinerOps = PAN_ARCH >= 14,
+      .maxFragmentSize = {4, 4},
+      .maxFragmentSizeAspectRatio = 2,
+      .maxFragmentShadingRateCoverageSamples = 16,
+      .maxFragmentShadingRateRasterizationSamples = VK_SAMPLE_COUNT_4_BIT,
+      .fragmentShadingRateWithShaderDepthStencilWrites = PAN_ARCH >= 14,
+      .fragmentShadingRateWithSampleMask = PAN_ARCH >= 14,
+      .fragmentShadingRateWithShaderSampleMask = PAN_ARCH >= 14,
+      .fragmentShadingRateWithConservativeRasterization = PAN_ARCH >= 14,
+      .fragmentShadingRateWithFragmentShaderInterlock = false,
+      .fragmentShadingRateWithCustomSampleLocations = false,
+      .fragmentShadingRateStrictMultiplyCombiner = PAN_ARCH >= 14,
 
       /* VK_EXT_graphics_pipeline_library */
       .graphicsPipelineLibraryFastLinking = true,

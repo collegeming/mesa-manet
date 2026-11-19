@@ -87,12 +87,16 @@ impl WordCopies<'_> {
                 }
             }
             Op::FAdd(op) => {
+                if op.dst.lanes.is_f16_narrow() {
+                    return;
+                }
                 if let DstRef::SSA(vec) = &op.dst.dst_ref {
                     debug_assert_eq!(vec.comps(), 1);
                     let ssa = vec[0];
 
                     if op.round == FRound::NearestEven
                         && op.clamp == FClamp::None
+                        && !op.dst.lanes.is_f16_narrow()
                     {
                         if op.srcs[0].is_fneg_zero(op.dst_type) {
                             self.add_copy(ssa, op.srcs[1].clone(), op.dst_type);
@@ -248,7 +252,7 @@ impl WordCopies<'_> {
             SrcMod::None => (),
             SrcMod::BNot => {
                 // BNot requires an integer type
-                if !src_type.is_int_type() {
+                if !src_type.is_any_int_type() {
                     return;
                 }
             }

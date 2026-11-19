@@ -111,10 +111,10 @@ GENX(pan_image_view_can_crc)(const struct pan_image_view *view,
    if (!drm_is_afbc(mod))
       return true;
 
-   /* TODO: Temporarily disallow CRC on v14+ with AFBC, re-enable after fix. */
-   if (PAN_ARCH >= 14)
+   const struct pan_image *image =
+      pan_image_view_get_first_plane(view).image;
+   if (PAN_ARCH >= 14 && !(PAN_ARCH == 15 && image->props.afbc_crc))
       return false;
-   
    /* Only sparse AFBC can be render targets. */
    assert(mod & AFBC_FORMAT_MOD_SPARSE);
 
@@ -755,6 +755,26 @@ get_yuv_rt_formats(enum pipe_format pfmt, uint32_t *writeback,
       *writeback = MALI_YUV_WRITEBACK_FORMAT_Y10X6_U10X6V10X6_420;
       *yuv_swizzle = MALI_YUV_SWIZZLE_UVYA;
       break;
+   case PIPE_FORMAT_NV16:
+      *internal = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
+      *writeback = MALI_YUV_WRITEBACK_FORMAT_Y8_U8V8_422;
+      *yuv_swizzle = MALI_YUV_SWIZZLE_UVYA;
+      break;
+   case PIPE_FORMAT_Y8_U8_V8_422_UNORM:
+      *internal = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
+      *writeback = MALI_YUV_WRITEBACK_FORMAT_Y8_U8_V8_422;
+      *yuv_swizzle = MALI_YUV_SWIZZLE_UVYA;
+      break;
+   case PIPE_FORMAT_G8B8_G8R8_UNORM:
+      *internal = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
+      *writeback = MALI_YUV_WRITEBACK_FORMAT_Y8U8Y8V8;
+      *yuv_swizzle = MALI_YUV_SWIZZLE_UVYA;
+      break;
+   case PIPE_FORMAT_X6G10_X6B10X6R10_422_UNORM:
+      *internal = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R10G10B10A2;
+      *writeback = MALI_YUV_WRITEBACK_FORMAT_Y10X6_U10X6V10X6_422;
+      *yuv_swizzle = MALI_YUV_SWIZZLE_UVYA;
+      break;
 #endif
    default:
       UNREACHABLE("invalid yuv pipe format");
@@ -784,6 +804,8 @@ emit_yuv_color_attachment(const struct pan_attachment_info *att, void *payload)
       cfg.writeback_block_format = MALI_BLOCK_FORMAT_LINEAR;
       get_yuv_rt_formats(iview->format, &cfg.writeback_format,
                          &cfg.internal_format, &cfg.swizzle, &cfg.yuv_swizzle);
+      if (iview->yuv.swap_chroma)
+         cfg.yuv_swizzle = MALI_YUV_SWIZZLE_VUYA;
       cfg.conversion_mode = MALI_YUV_CONVERSION_MODE_NO_CONVERSION;
       cfg.full_range = true;
       cfg.unsigned_cr_range = true;
@@ -1852,6 +1874,15 @@ GENX(pan_select_tiler_hierarchy_mask)(unsigned width, unsigned height,
    if (PAN_ARCH >= 12 &&
        pan_calc_bins_pointer_size(width, height, tile_size, 0) <= mem_budget)
       return 0;
+
+   if (PAN_ARCH >= 12) {
+      uint32_t mask = tile_size > 32 * 32 ? 0xAC : 0xAA;
+      while (util_last_bit(mask) < PAN_BIN_LEVEL_COUNT &&
+             pan_calc_bins_pointer_size(width, height, tile_size, mask) >
+                mem_budget)
+         mask <<= 1;
+      return mask;
+   }
 
    uint32_t max_fb_wh = MAX2(width, height);
    uint32_t last_hierarchy_bit = util_last_bit(DIV_ROUND_UP(max_fb_wh, 16));

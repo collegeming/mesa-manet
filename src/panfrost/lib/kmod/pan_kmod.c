@@ -21,6 +21,12 @@ extern const struct pan_kmod_ops panthor_kmod_ops;
 #endif
 #if defined(HAVE_PAN_KMOD_KBASE)
 extern const struct pan_kmod_ops kbase_kmod_ops;
+/* The upstream static_assert pins these sizes to the kbase-rs FFI layout.
+ * The Windows ICD has no Rust side, and tools/patch_mesa.py adds the two
+ * Windows-only ops members (bo_alloc_shared, bo_import_platform) to
+ * struct pan_kmod_ops, so the ops count differs by contract; the struct
+ * size assert is dropped on this transport.
+ */
 #endif
 
 static const struct {
@@ -134,9 +140,24 @@ struct pan_kmod_bo *
 pan_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm,
                   uint64_t size, uint32_t flags)
 {
+   return pan_kmod_bo_alloc_at(dev, exclusive_vm, size, flags, 0);
+}
+
+struct pan_kmod_bo *
+pan_kmod_bo_alloc_at(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm,
+                     uint64_t size, uint32_t flags, uint64_t va)
+{
    struct pan_kmod_bo *bo;
 
-   bo = dev->ops->bo_alloc(dev, exclusive_vm, size, flags);
+   if (va || (flags & PAN_KMOD_BO_FLAG_CAPTURE_REPLAY)) {
+      if (!dev->ops->bo_alloc_at) {
+         errno = EINVAL;
+         return NULL;
+      }
+      bo = dev->ops->bo_alloc_at(dev, exclusive_vm, size, flags, va);
+   } else {
+      bo = dev->ops->bo_alloc(dev, exclusive_vm, size, flags);
+   }
    if (!bo)
       return NULL;
 

@@ -40,6 +40,21 @@ fn supported_mods(
     }
 }
 
+pub fn small_const_fau(model: &dyn Model, op: &Op, src: &Src) -> Option<FAURef> {
+    let mut mods = Vec::new();
+    let mut swizzles = Vec::new();
+    supported_mods(model, op, src, &mut mods);
+    supported_swizzles(model, op, src, &mut swizzles);
+    try_as_small_const(
+        src,
+        op.src_type(src),
+        &model.fau().small_constants,
+        &mods,
+        &swizzles,
+    )
+    .map(|repl| FAURef::from(repl.sc))
+}
+
 fn any_imm_srcs(instr: &Instr) -> bool {
     instr
         .srcs()
@@ -145,6 +160,7 @@ fn try_as_small_const<'a>(
 }
 
 fn find_lowerable_srcs<'a>(
+    model: &dyn Model,
     instr: &Instr,
     swizzles: &[Vec<Swizzle>],
     mods: &[Vec<SrcMod>],
@@ -153,6 +169,11 @@ fn find_lowerable_srcs<'a>(
     let mut result: SmallVec<_> = Default::default();
 
     for (idx, (src, src_type)) in instr.srcs_types().enumerate() {
+        if let SrcRef::Imm32(imm) = &src.src_ref {
+            if model.op_src_supports_imm32(&instr.op, src, imm.get()) {
+                continue;
+            }
+        }
         if let Some(repl) = try_as_small_const(
             src,
             src_type,
@@ -204,7 +225,13 @@ fn lower_instr(instr: &mut Instr, model: &dyn Model, ctx: &mut VecCtx) {
             p.unapply(instr);
             continue;
         }
-        let r = find_lowerable_srcs(instr, &ctx.swizzles, &ctx.mods, sc_table);
+        let r = find_lowerable_srcs(
+            model,
+            instr,
+            &ctx.swizzles,
+            &ctx.mods,
+            sc_table,
+        );
         p.unapply(instr);
 
         if r.len() > replacements.len() {

@@ -70,9 +70,14 @@ panvk_per_arch(CreateQueryPool)(VkDevice _device,
       reports_per_query = 1;
       break;
    }
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+      reports_per_query = 2;
+      break;
 #endif
 #if PAN_ARCH >= 15
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
+   case VK_QUERY_TYPE_MICROMAP_COMPACTED_SIZE_EXT:
+   case VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR:
@@ -291,9 +296,17 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
                cpu_write_query_result(dst, 0, flags, src[0].value);
             break;
          }
+         case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+            if (write_results) {
+               cpu_write_query_result(dst, 0, flags, src[0].value);
+               cpu_write_query_result(dst, 1, flags, src[1].value);
+            }
+            break;
 #endif
 #if PAN_ARCH >= 15
          case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
+         case VK_QUERY_TYPE_MICROMAP_COMPACTED_SIZE_EXT:
+         case VK_QUERY_TYPE_MICROMAP_SERIALIZATION_SIZE_EXT:
          case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
          case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR:
          case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR:
@@ -310,7 +323,11 @@ panvk_per_arch(GetQueryPoolResults)(VkDevice _device, VkQueryPool queryPool,
          status = VK_NOT_READY;
 
       if (flags & VK_QUERY_RESULT_WITH_AVAILABILITY_BIT)
-         cpu_write_query_result(dst, 1, flags, available);
+         cpu_write_query_result(
+            dst,
+            pool->vk.query_type == VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT
+               ? 2 : 1,
+            flags, available);
    }
 
    return status;

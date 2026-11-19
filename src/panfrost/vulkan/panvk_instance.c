@@ -58,9 +58,9 @@ static const struct debug_control panvk_debug_options[] = {
    {"no_user_mmap_sync", PANVK_DEBUG_NO_USER_MMAP_SYNC},
    {"cached_before_coherent", PANVK_DEBUG_CACHED_BEFORE_COHERENT},
    {"no_extended_va_range", PANVK_DEBUG_NO_EXTENDED_VA_RANGE},
-   {"hsr_prepass", PANVK_DEBUG_HSR_PREPASS},
    {"no_crc", PANVK_DEBUG_NO_CRC},
    {"kbase_diag", PANVK_DEBUG_KBASE_DIAG},
+   {"csstats", PANVK_DEBUG_CSSTATS},
    {NULL, 0},
 };
 
@@ -201,7 +201,8 @@ panvk_enumerate_physical_devices(struct vk_instance *vk_instance)
       snprintf(path, sizeof(path), "/dev/mali%d", i);
       const char *virtio = getenv("PANVK_KBASE_VIRTIO");
       if (virtio) {
-         if (i) break;
+         if (i)
+            break;
          snprintf(path, sizeof(path), "%s", virtio);
       }
 
@@ -391,8 +392,8 @@ PFN_vkVoidFunction
 panvk_GetInstanceProcAddr(VkInstance _instance, const char *pName)
 {
    VK_FROM_HANDLE(panvk_instance, instance, _instance);
-   return vk_instance_get_proc_addr(&instance->vk, &panvk_instance_entrypoints,
-                                    pName);
+   return vk_instance_get_proc_addr(instance ? &instance->vk : NULL,
+                                    &panvk_instance_entrypoints, pName);
 }
 
 /* The loader wants us to expose a second GetInstanceProcAddr function

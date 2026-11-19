@@ -178,7 +178,11 @@ meta_gfx_start(struct panvk_cmd_buffer *cmdbuf,
    save_ctx->fs.shader = cmdbuf->state.gfx.fs.shader;
    save_ctx->fs.desc = cmdbuf->state.gfx.fs.desc;
    save_ctx->vs.shader = cmdbuf->state.gfx.vs.shader;
+   save_ctx->vs.bound = cmdbuf->state.gfx.vs.bound;
    save_ctx->vs.desc = cmdbuf->state.gfx.vs.desc;
+   save_ctx->tcs = cmdbuf->state.gfx.tess.tcs.shader;
+   save_ctx->tes = cmdbuf->state.gfx.tess.tes.shader;
+   save_ctx->tes_bound = cmdbuf->state.gfx.tess.tes.bound;
    save_ctx->vb0 = cmdbuf->state.gfx.vb.bufs[0];
 
    save_ctx->dyn_state.all = cmdbuf->vk.dynamic_graphics_state;
@@ -246,7 +250,19 @@ meta_gfx_end(struct panvk_cmd_buffer *cmdbuf,
    cmdbuf->state.gfx.fs.shader = save_ctx->fs.shader;
    cmdbuf->state.gfx.fs.desc = save_ctx->fs.desc;
    cmdbuf->state.gfx.vs.shader = save_ctx->vs.shader;
+   cmdbuf->state.gfx.vs.bound = save_ctx->vs.bound;
    cmdbuf->state.gfx.vs.desc = save_ctx->vs.desc;
+   if (cmdbuf->state.gfx.tess.tcs.shader != save_ctx->tcs) {
+      cmdbuf->state.gfx.tess.tcs.shader = save_ctx->tcs;
+      gfx_state_set_dirty(cmdbuf, TCS);
+      gfx_state_set_dirty(cmdbuf, TCS_PUSH_UNIFORMS);
+   }
+   cmdbuf->state.gfx.tess.tes.bound = save_ctx->tes_bound;
+   if (cmdbuf->state.gfx.tess.tes.shader != save_ctx->tes) {
+      cmdbuf->state.gfx.tess.tes.shader = save_ctx->tes;
+      gfx_state_set_dirty(cmdbuf, TES);
+      gfx_state_set_dirty(cmdbuf, TES_PUSH_UNIFORMS);
+   }
    cmdbuf->state.gfx.vb.bufs[0] = save_ctx->vb0;
 
 #if PAN_ARCH < 9
@@ -494,6 +510,13 @@ panvk_per_arch(CmdCopyMemoryToImageKHR)(
    if (lower_copy_memory_to_image(commandBuffer, pCopyMemoryInfo))
       return;
 
+#if PAN_ARCH >= 10
+   if (img->block_copies) {
+      panvk_per_arch(cmd_copy_blocks_to_image)(cmdbuf, pCopyMemoryInfo);
+      return;
+   }
+#endif
+
    const bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(img);
    struct vk_meta_copy_image_properties img_props =
       panvk_meta_copy_get_image_properties(img, use_gfx_pipeline, true);
@@ -524,6 +547,16 @@ panvk_per_arch(CmdCopyMemoryToImageKHR)(
                                    VK_PIPELINE_BIND_POINT_COMPUTE);
       panvk_per_arch(cmd_meta_compute_end)(cmdbuf, &save);
    }
+
+#if PAN_ARCH >= 10
+   if (img->bc_emu_format != VK_FORMAT_UNDEFINED) {
+      for (uint32_t i = 0; i < pCopyMemoryInfo->regionCount; i++) {
+         const VkDeviceMemoryImageCopyKHR *r = &pCopyMemoryInfo->pRegions[i];
+         panvk_per_arch(cmd_bc_emu_decode)(cmdbuf, img, &r->imageSubresource,
+                                           r->imageOffset, r->imageExtent);
+      }
+   }
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -534,6 +567,14 @@ panvk_per_arch(CmdCopyImageToMemoryKHR)(
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    VK_FROM_HANDLE(panvk_image, img, pCopyMemoryInfo->image);
+
+#if PAN_ARCH >= 10
+   if (img->block_copies) {
+      panvk_per_arch(cmd_copy_blocks_from_image)(cmdbuf, pCopyMemoryInfo);
+      return;
+   }
+#endif
+
    struct vk_meta_copy_image_properties img_props =
       panvk_meta_copy_get_image_properties(img, false, false);
    struct panvk_cmd_meta_compute_save_ctx save = {0};
@@ -723,6 +764,13 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
    if (lower_copy_image(commandBuffer, pCopyImageInfo))
       return;
 
+#if PAN_ARCH >= 10
+   if (src_img->block_copies || dst_img->block_copies) {
+      panvk_per_arch(cmd_copy_blocks_image)(cmdbuf, pCopyImageInfo);
+      return;
+   }
+#endif
+
    const bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dst_img);
    struct vk_meta_copy_image_properties dst_img_props =
       panvk_meta_copy_get_image_properties(dst_img, use_gfx_pipeline, true);
@@ -755,6 +803,21 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
                          VK_PIPELINE_BIND_POINT_COMPUTE);
       panvk_per_arch(cmd_meta_compute_end)(cmdbuf, &save);
    }
+
+#if PAN_ARCH >= 10
+   if (dst_img->bc_emu_format != VK_FORMAT_UNDEFINED) {
+      for (uint32_t i = 0; i < pCopyImageInfo->regionCount; i++) {
+         const VkImageCopy2 *r = &pCopyImageInfo->pRegions[i];
+         VkExtent3D extent = r->extent;
+         if (!vk_format_is_compressed(src_img->vk.format)) {
+            extent.width *= 4;
+            extent.height *= 4;
+         }
+         panvk_per_arch(cmd_bc_emu_decode)(cmdbuf, dst_img, &r->dstSubresource,
+                                           r->dstOffset, extent);
+      }
+   }
+#endif
 }
 
 void

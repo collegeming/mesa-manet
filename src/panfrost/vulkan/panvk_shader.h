@@ -20,6 +20,7 @@
 
 #include "vk_shader.h"
 #include "panvk_macros.h"
+#include "libpan/gs.h"
 
 #include "panvk_cmd_push_constant.h"
 #include "panvk_descriptor_set.h"
@@ -42,7 +43,15 @@ extern const struct vk_device_shader_ops panvk_per_arch(offline_shader_ops);
 
 VkResult panvk_per_arch(compile_shader_offline)(
    struct panvk_device *dev, struct vk_shader_compile_info *info,
-   bool enable_preamble, struct vk_shader **shader_out);
+   const struct vk_graphics_pipeline_state *state,
+   const uint32_t *noperspective_varyings, bool enable_preamble,
+   struct vk_shader **shader_out);
+
+struct kraidoc_variant;
+
+unsigned panvk_per_arch(offline_shader_variants)(
+   const struct vk_shader *shader, struct kraidoc_variant *variants,
+   unsigned max);
 
 #define MAX_RTS 8
 #define MAX_VS_ATTRIBS 16
@@ -150,6 +159,7 @@ struct panvk_common_sysvals {
 struct panvk_poly_sysvals {
    aligned_u64 vertex_param_buffer;
    aligned_u64 tess_param_buffer;
+   aligned_u64 geometry_param_buffer;
 } __attribute__((aligned(FAU_WORD_SIZE)));
 
 static_assert((sizeof(struct panvk_poly_sysvals) % FAU_WORD_SIZE) == 0,
@@ -190,6 +200,8 @@ struct panvk_graphics_sysvals {
       } scale, offset;
    } viewport;
 
+   aligned_u64 viewport_array;
+
    struct {
 #if PAN_ARCH < 9
       int32_t raw_vertex_offset;
@@ -197,6 +209,7 @@ struct panvk_graphics_sysvals {
       int32_t first_vertex;
       int32_t base_instance;
       uint32_t noperspective_varyings;
+      uint32_t cull_det;
    } vs;
 
    struct {
@@ -204,10 +217,13 @@ struct panvk_graphics_sysvals {
       aligned_u64 offset_ptr[MAX_XFB_BUFFERS];
       uint32_t num_vertices;
       uint32_t _pad;
+      aligned_u64 params;
    } xfb;
 
    struct {
       aligned_u64 blend_descs[MAX_RTS];
+      uint32_t clip_cull;
+      uint32_t _pad;
    } fs;
 
    struct panvk_input_attachment_info iam[INPUT_ATTACHMENT_MAP_SIZE];
@@ -237,6 +253,19 @@ static_assert((offsetof(struct panvk_graphics_sysvals, desc) % FAU_WORD_SIZE) ==
               "panvk_graphics_sysvals::desc must be 8-byte aligned");
 #endif
 
+struct panvk_rt_dispatch_params {
+   uint64_t stack_base;
+   uint64_t stack_stride;
+   uint64_t push_constants;
+   uint64_t stage_ids;
+   uint64_t native_frame_stride;
+   uint64_t stack_tls_offset;
+   uint64_t external_state_scale;
+};
+
+static_assert(sizeof(struct panvk_rt_dispatch_params) == 56,
+              "ray tracing dispatch parameters size");
+
 struct panvk_compute_sysvals {
    struct {
       uint32_t x, y, z;
@@ -259,12 +288,29 @@ struct panvk_compute_sysvals {
 
    aligned_u64 rt_dispatch;
 
+#if PAN_ARCH >= 15
+   struct panvk_rt_dispatch_params rt_dispatch_params;
+   struct {
+      uint32_t x, y, z, pad;
+   } rt_launch_size;
+#endif
+
 #if PAN_ARCH < 9
    struct {
       aligned_u64 sets[PANVK_DESC_TABLE_COMPUTE_COUNT];
    } desc;
 #endif
 } __attribute__((aligned(FAU_WORD_SIZE)));
+
+#if PAN_ARCH >= 15
+static_assert(offsetof(struct panvk_compute_sysvals, rt_dispatch_params) ==
+                 offsetof(struct panvk_compute_sysvals, rt_dispatch) + 8,
+              "ray tracing dispatch parameters follow dispatch pointer");
+static_assert(offsetof(struct panvk_compute_sysvals, rt_launch_size) ==
+                 offsetof(struct panvk_compute_sysvals, rt_dispatch_params) +
+                    sizeof(struct panvk_rt_dispatch_params),
+              "ray tracing launch size follows dispatch parameters");
+#endif
 
 static_assert(offsetof(struct panvk_compute_sysvals, common) ==
                  offsetof(struct panvk_common_sysvals, common),
@@ -444,6 +490,8 @@ struct panvk_shader_variant {
    struct pan_shader_info info;
    struct panvk_shader_variant *preamble;
    uint16_t xfb_stride[MAX_XFB_BUFFERS];
+   uint16_t xfb_output_end[MAX_XFB_BUFFERS];
+   uint32_t ray_query_slots;
 
    union {
       struct {
@@ -452,10 +500,13 @@ struct panvk_shader_variant {
 
       struct {
          struct pan_earlyzs_lut earlyzs_lut;
+         struct pan_earlyzs_lut earlyzs_lut_no_discard;
          uint32_t input_attachment_read;
          uint32_t tile_image_color_read;
          bool tile_image_z_read;
          bool tile_image_s_read;
+         bool clip_cull_only_discard;
+         bool can_fpk_no_discard;
       } fs;
    };
 
@@ -505,6 +556,32 @@ enum panvk_vs_variant {
    PANVK_VS_VARIANTS,
 };
 
+enum panvk_gs_variant {
+   PANVK_GS_VARIANT_RAST,
+   PANVK_GS_VARIANT_MAIN,
+   PANVK_GS_VARIANT_COUNT,
+   PANVK_GS_VARIANT_PRE,
+   PANVK_GS_VARIANT_XFB,
+   PANVK_GS_VARIANTS,
+};
+
+struct panvk_gs_info {
+   uint8_t present;
+   uint8_t mode;
+   uint8_t shape;
+   uint8_t xfb;
+   uint8_t prefix_sum;
+   uint8_t count_words;
+   uint16_t max_indices;
+   uint16_t vertex_stride;
+   uint8_t dynamic_vertices;
+   struct pan_varying_layout varyings;
+   struct panvk_shader_desc_info count_desc;
+};
+
+#define PANVK_GS_RASTER_PARAMS_OFFSET 320
+
+
 /*
  * Original Vulkan tessellation metadata retained before libpoly lowers
  * TCS to compute and TES to a hardware vertex shader.
@@ -528,14 +605,24 @@ struct panvk_tess_info {
    uint8_t ccw;
 };
 
+struct panvk_shader_fallback;
+
 struct panvk_shader {
    struct vk_shader vk;
 
    struct panvk_shader *no_preamble;
 
+   struct panvk_shader_fallback *bg_no_preamble;
+
+   struct panvk_shader *tess_vs;
+
+   struct panvk_shader *polygon_gs[2];
+
    struct panvk_shader_desc_info desc_info;
 
    struct panvk_tess_info tess;
+
+   struct panvk_gs_info gs;
 
    struct panvk_shader_variant variants[];
 };
@@ -543,8 +630,11 @@ struct panvk_shader {
 static inline unsigned
 panvk_shader_num_variants(mesa_shader_stage stage)
 {
-   if (stage == MESA_SHADER_VERTEX)
+   if (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_TESS_EVAL)
       return PANVK_VS_VARIANTS;
+
+   if (stage == MESA_SHADER_GEOMETRY)
+      return PANVK_GS_VARIANTS;
 
    return 1;
 }
@@ -554,6 +644,14 @@ static const char *panvk_vs_shader_variant_name[] = {
    [PANVK_VS_VARIANT_XFB] = "xfb",
 };
 
+static const char *panvk_gs_shader_variant_name[] = {
+   [PANVK_GS_VARIANT_RAST] = NULL,
+   [PANVK_GS_VARIANT_MAIN] = "main",
+   [PANVK_GS_VARIANT_COUNT] = "count",
+   [PANVK_GS_VARIANT_PRE] = "pre",
+   [PANVK_GS_VARIANT_XFB] = "xfb",
+};
+
 static const char *
 panvk_shader_variant_name(const struct panvk_shader *shader,
                           struct panvk_shader_variant *variant)
@@ -561,12 +659,19 @@ panvk_shader_variant_name(const struct panvk_shader *shader,
    unsigned i = variant - shader->variants;
    assert(i < panvk_shader_num_variants(shader->vk.stage));
 
-   if (shader->vk.stage == MESA_SHADER_VERTEX) {
+   if (shader->vk.stage == MESA_SHADER_VERTEX ||
+       shader->vk.stage == MESA_SHADER_TESS_EVAL) {
       assert(i < ARRAY_SIZE(panvk_vs_shader_variant_name));
       return panvk_vs_shader_variant_name[i];
    }
 
-   assert(panvk_shader_num_variants(shader->vk.stage) == 1);
+   if (shader->vk.stage == MESA_SHADER_GEOMETRY) {
+      assert(i < ARRAY_SIZE(panvk_gs_shader_variant_name));
+      return panvk_gs_shader_variant_name[i];
+   }
+
+   assert(shader->vk.stage == MESA_SHADER_TESS_EVAL ||
+          panvk_shader_num_variants(shader->vk.stage) == 1);
 
    return NULL;
 }
@@ -577,7 +682,8 @@ panvk_shader_only_variant(const struct panvk_shader *shader)
    if (!shader)
       return NULL;
 
-   assert(panvk_shader_num_variants(shader->vk.stage) == 1);
+   assert(shader->vk.stage == MESA_SHADER_TESS_EVAL ||
+          panvk_shader_num_variants(shader->vk.stage) == 1);
    return &shader->variants[0];
 }
 
@@ -596,7 +702,9 @@ panvk_shader_xfb_variant(const struct panvk_shader *shader)
    if (!shader)
       return NULL;
 
-   return &shader->variants[PANVK_VS_VARIANT_XFB];
+   return &shader->variants[shader->vk.stage == MESA_SHADER_GEOMETRY
+                               ? PANVK_GS_VARIANT_XFB
+                               : PANVK_VS_VARIANT_XFB];
 }
 
 #ifndef PANVK_OFFLINE_ONLY

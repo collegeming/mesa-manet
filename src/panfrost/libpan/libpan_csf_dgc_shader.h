@@ -13,7 +13,7 @@
  * This also describes an odd number of compiler-promoted immediates without
  * overwriting the other half of a slot.
  */
-#define PANLIB_DGC_MAX_FAU_WORDS 128
+#define PANLIB_DGC_MAX_FAU_WORDS 256
 #define PANLIB_DGC_MAX_VARYINGS 128
 #define PANLIB_DGC_EARLYZS_STATES 24
 #define PANLIB_DGC_MAX_DYNAMIC_BUFFERS 24

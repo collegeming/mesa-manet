@@ -9,8 +9,10 @@ mod data_type;
 pub mod decode;
 mod dst_mod_prop;
 mod encode_v9;
+mod fau_alloc;
 mod flow;
 mod foldable;
+mod helper_invocations;
 #[cfg(test)]
 mod hw_tests;
 mod instrumentation;
@@ -21,8 +23,12 @@ mod legalize;
 mod legalize_src_swizzles;
 mod liveness;
 mod lower_blend_call;
+mod lower_rt_calls;
+mod lower_rt_frames;
 mod lower_copy;
+mod lower_math;
 mod lower_mkvec_swz;
+mod mark_last_use;
 mod message_slots;
 mod model;
 mod nir;
@@ -33,7 +39,10 @@ mod opt_dce;
 mod opt_exec_units;
 mod opt_flow;
 mod opt_normalize_consts;
-mod opt_promote_consts;
+mod opt_redundant_movs;
+mod opt_share_copies;
+mod opt_tex_dual;
+mod opt_sink_staging;
 mod opt_var;
 mod parallel_copy;
 mod phi;
@@ -63,6 +72,7 @@ mod debug {
             const PRINT_RAW_CONST = 1 << 4;
             const STATS = 1 << 5;
             const NO_PREAMBLE = 1 << 6;
+            const NO_TEX_DUAL = 1 << 8;
         }
     }
 
@@ -82,6 +92,7 @@ mod debug {
                 "print-raw-constants" => flags |= DebugFlags::PRINT_RAW_CONST,
                 "stats" => flags |= DebugFlags::STATS,
                 "nopreamble" => flags |= DebugFlags::NO_PREAMBLE,
+                "no-tex-dual" => flags |= DebugFlags::NO_TEX_DUAL,
                 unk => eprintln!("Unknown {debug_var} flag \"{}\"", unk),
             }
         }

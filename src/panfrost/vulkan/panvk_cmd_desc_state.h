@@ -36,12 +36,16 @@ struct panvk_shader_desc_state {
    struct {
       uint64_t dev_addr;
       uint32_t size;
-      /* CPU view, for resolving promoted UBO words (cmd_emit_fau_ubo_copies) */
-      const void *host;
    } driver_set;
    uint64_t res_table;
 #endif
 };
+
+#if PAN_ARCH >= 15
+#define PANVK_DRIVER_SET_HAS_DYN_BUFS false
+#else
+#define PANVK_DRIVER_SET_HAS_DYN_BUFS true
+#endif
 
 #if PAN_ARCH >= 9
 static inline uint32_t
@@ -56,7 +60,7 @@ panvk_shader_res_table_count(struct panvk_shader_desc_state *shader_desc_state)
 struct panvk_push_set {
    struct panvk_cmd_pool_obj base;
    struct panvk_descriptor_set set;
-   struct panvk_opaque_desc descs[MAX_PUSH_DESCS];
+   struct panvk_opaque_desc descs[PANVK_MAX_PUSH_DESC_SLOTS];
 };
 
 struct panvk_descriptor_state {

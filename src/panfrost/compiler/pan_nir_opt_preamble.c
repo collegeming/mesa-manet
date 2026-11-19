@@ -5,7 +5,53 @@ struct preamble_ctx {
    uint8_t *allowed;
    unsigned result_base;
    bool fau_pressure;
+   bool buffer_addresses;
 };
+
+static int
+pilot_handle_table(nir_def *handle)
+{
+   nir_scalar s = nir_scalar_chase_movs(nir_get_scalar(handle, 0));
+   uint64_t table = UINT64_MAX;
+
+   if (nir_scalar_is_const(s)) {
+      table = nir_scalar_as_uint(s) >> 24;
+   } else if (nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_ior) {
+      for (unsigned i = 0; i < 2; i++) {
+         nir_scalar src = nir_scalar_chase_alu_src(s, i);
+         if (nir_scalar_is_const(src) &&
+             !(nir_scalar_as_uint(src) & BITFIELD_MASK(24)))
+            table = nir_scalar_as_uint(src) >> 24;
+      }
+   }
+
+   return table < 64 ? table : -1;
+}
+
+static bool
+pilot_desc_allowed(nir_intrinsic_instr *intr)
+{
+   return pilot_handle_table(intr->src[0].ssa) >= 0;
+}
+
+static bool
+pilot_push_allowed(nir_intrinsic_instr *intr, const struct preamble_ctx *ctx)
+{
+   if (!nir_src_is_const(intr->src[0]))
+      return false;
+
+   unsigned offset = nir_intrinsic_base(intr) + nir_src_as_uint(intr->src[0]);
+   unsigned bytes =
+      DIV_ROUND_UP(intr->def.num_components * intr->def.bit_size, 8);
+   unsigned first = offset / 4;
+   unsigned last = (offset + bytes - 1) / 4;
+
+   if (first >= PAN_MAX_PUSH)
+      return true;
+
+   return !BITSET_TEST_RANGE(ctx->inputs->fau.pilot_volatile, first,
+                             MIN2(last, PAN_MAX_PUSH - 1));
+}
 
 static bool allowed_def(nir_def *def, struct preamble_ctx *ctx);
 
@@ -34,16 +80,22 @@ allowed_def(nir_def *def, struct preamble_ctx *ctx)
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
       switch (intr->intrinsic) {
       case nir_intrinsic_load_push_constant:
-         allowed = nir_src_is_const(intr->src[0]);
+         allowed = pilot_push_allowed(intr, ctx);
          break;
       case nir_intrinsic_load_ubo:
+         allowed = pilot_desc_allowed(intr);
+         break;
       case nir_intrinsic_load_constant:
       case nir_intrinsic_load_global_constant:
          allowed = true;
          break;
       case nir_intrinsic_load_ssbo:
          allowed = (nir_intrinsic_access(intr) & ACCESS_CAN_REORDER) &&
-                   !(nir_intrinsic_access(intr) & ACCESS_VOLATILE);
+                   !(nir_intrinsic_access(intr) & ACCESS_VOLATILE) &&
+                   pilot_desc_allowed(intr);
+         break;
+      case nir_intrinsic_load_ssbo_address:
+         allowed = ctx->buffer_addresses && pilot_desc_allowed(intr);
          break;
       default:
          break;
@@ -159,6 +211,7 @@ base_instr_cost(nir_instr *instr, const struct preamble_ctx *ctx)
             return ctx->fau_pressure ? 4 : 0;
          return 5;
       case nir_intrinsic_load_ssbo:
+      case nir_intrinsic_load_ssbo_address:
       case nir_intrinsic_load_global_constant:
       case nir_intrinsic_load_constant:
          return 5;
@@ -237,10 +290,19 @@ mark_speculatable_uniform_loads(nir_function_impl *impl,
          if (instr->type != nir_instr_type_intrinsic)
             continue;
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         bool desc_load =
+            intr->intrinsic == nir_intrinsic_load_ssbo &&
+            nir_src_is_const(intr->src[0]) && nir_src_is_const(intr->src[1]) &&
+            pan_res_handle_get_table(nir_src_as_uint(intr->src[0])) == 62;
+         bool buffer_address =
+            ctx->buffer_addresses &&
+            intr->intrinsic == nir_intrinsic_load_ssbo_address &&
+            nir_src_is_const(intr->src[0]) && pilot_desc_allowed(intr);
          bool uniform_load =
             (intr->intrinsic == nir_intrinsic_load_push_constant &&
              nir_src_is_const(intr->src[0])) ||
-            (!robust_ubo && pushable_ubo_load(intr, ctx));
+            (!robust_ubo && pushable_ubo_load(intr, ctx)) || desc_load ||
+            buffer_address;
          if (uniform_load && nir_intrinsic_has_access(intr))
             nir_intrinsic_set_access(intr, nir_intrinsic_access(intr) |
                                               ACCESS_CAN_REORDER |
@@ -250,36 +312,301 @@ mark_speculatable_uniform_loads(nir_function_impl *impl,
 }
 
 static bool
-lower_main(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+lower_preamble_select(nir_builder *b, nir_alu_instr *alu, void *data)
 {
-   struct preamble_ctx *ctx = data;
+   if (alu->op != nir_op_bcsel)
+      return false;
+   b->cursor = nir_before_instr(&alu->instr);
+   nir_def *cond = nir_ssa_for_alu_src(b, alu, 0);
+   nir_src_rewrite(&alu->src[0].src, nir_i2iN(b, cond, alu->def.bit_size));
+   for (unsigned i = 0; i < NIR_MAX_VEC_COMPONENTS; i++)
+      alu->src[0].swizzle[i] = i;
+   alu->op = nir_op_bcsel_pan;
+   return true;
+}
+
+static bool
+opt_preamble_select(nir_shader *nir,
+                     const nir_opt_peephole_select_options *opts)
+{
+   if (!nir_opt_peephole_select(nir, opts))
+      return false;
+   nir_shader_alu_pass(nir, lower_preamble_select, nir_metadata_control_flow,
+                      NULL);
+   return true;
+}
+
+static void
+prepare_uniform_branches(nir_shader *nir, struct preamble_ctx *ctx)
+{
+   const nir_opt_peephole_select_options opts = {
+      .limit = 64,
+      .collapse_limit = 64,
+   };
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   bool tensor = false;
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_intrinsic) {
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            tensor |= op == nir_intrinsic_load_tensor_pan ||
+                      op == nir_intrinsic_store_tensor_pan;
+         }
+      }
+   }
+   if (!tensor)
+      return;
+   bool progress;
+   do {
+      nir_index_ssa_defs(impl);
+      ctx->allowed = calloc(impl->ssa_alloc, 1);
+      if (!ctx->allowed)
+         return;
+      nir_divergence_analysis(nir);
+      mark_speculatable_uniform_loads(impl, ctx);
+      nir_foreach_block(block, impl) {
+         nir_if *nif = nir_block_get_following_if(block);
+         if (!nif || nif->control != nir_selection_control_dont_flatten ||
+             nir_src_is_divergent(&nif->condition) ||
+             !allowed_def(nif->condition.ssa, ctx) ||
+             exec_list_length(&nif->then_list) != 3 ||
+             !nir_cf_list_is_empty_block(&nif->else_list))
+            continue;
+
+         bool allowed = true;
+         nir_foreach_instr(instr, nir_if_first_then_block(nif)) {
+            nir_def *def = nir_instr_def(instr);
+            if (!def || !nir_instr_can_speculate(instr) ||
+                !allowed_def(def, ctx)) {
+               allowed = false;
+               break;
+            }
+         }
+         if (allowed)
+            nif->control = nir_selection_control_none;
+      }
+      free(ctx->allowed);
+      ctx->allowed = NULL;
+      progress = false;
+      NIR_PASS(progress, nir, opt_preamble_select, &opts);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+      NIR_PASS(progress, nir, nir_opt_cse);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_opt_dead_cf);
+   } while (progress);
+}
+
+static void
+prune_pilot_outputs(nir_shader *main, nir_shader *pilot, unsigned slots)
+{
+   bool *used = calloc(MAX2(slots, 1), sizeof(bool));
+   if (!used)
+      return;
+   nir_foreach_block(block, nir_shader_get_entrypoint(main)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_load_preamble) {
+            assert(nir_intrinsic_base(intr) < slots);
+            used[nir_intrinsic_base(intr)] = true;
+         }
+      }
+   }
+   nir_foreach_block(block, nir_shader_get_entrypoint(pilot)) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic == nir_intrinsic_store_preamble) {
+            assert(nir_intrinsic_base(intr) < slots);
+            if (!used[nir_intrinsic_base(intr)])
+               nir_instr_remove(instr);
+         }
+      }
+   }
+   free(used);
+}
+
+struct pilot_values {
+   struct pan_fau_virtual *virt;
+   int16_t *value_of_base;
+};
+
+static bool
+rebase_main_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct pilot_values *pv = data;
    if (intr->intrinsic != nir_intrinsic_load_preamble)
       return false;
 
-   b->cursor = nir_before_instr(&intr->instr);
-   nir_def *value = nir_load_push_constant(
-      b, intr->def.num_components, intr->def.bit_size,
-      nir_imm_int(b, (ctx->result_base + nir_intrinsic_base(intr)) * 4));
-   nir_def_replace(&intr->def, value);
+   int index = pv->value_of_base[nir_intrinsic_base(intr)];
+   assert(index >= 0);
+   nir_intrinsic_set_base(intr, pv->virt->values[index].word);
    return true;
+}
+
+static unsigned
+pilot_value_align(const nir_def *def, unsigned size)
+{
+   if (size >= 4)
+      return 4;
+   if (size >= 2 || def->bit_size == 64)
+      return 2;
+   return 1;
+}
+
+static void
+register_pilot_values(nir_shader *pilot, struct pilot_values *pv)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(pilot);
+   struct hash_table *seen = _mesa_pointer_hash_table_create(NULL);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (intr->intrinsic != nir_intrinsic_store_preamble)
+            continue;
+
+         nir_def *value = intr->src[0].ssa;
+         unsigned base = nir_intrinsic_base(intr);
+         unsigned size = DIV_ROUND_UP(value->num_components * value->bit_size, 32);
+         unsigned index = pan_fau_virtual_add(pv->virt, size,
+                                              pilot_value_align(value, size),
+                                              PAN_FAU_VALUE_PILOT,
+                                              (struct pan_ubo_relocation){0});
+         pv->value_of_base[base] = index;
+
+         struct hash_entry *entry = _mesa_hash_table_search(seen, value);
+         if (!entry) {
+            _mesa_hash_table_insert(seen, value, intr);
+            nir_intrinsic_set_base(intr, index);
+            continue;
+         }
+
+         nir_intrinsic_instr *kept = entry->data;
+         pv->virt->values[index].alias = nir_intrinsic_base(kept);
+         if (kept->instr.block != block) {
+            nir_instr *def_instr = nir_def_instr(value);
+            nir_instr_move(def_instr->type == nir_instr_type_phi
+                              ? nir_after_phis(def_instr->block)
+                              : nir_after_instr(def_instr),
+                           &kept->instr);
+         }
+         nir_instr_remove(instr);
+      }
+   }
+
+   _mesa_hash_table_destroy(seen, NULL);
+   nir_progress(true, impl, nir_metadata_control_flow);
+}
+
+#define PILOT_SINK_ADDRESS_HI 0x80002000
+
+struct pilot_buffer {
+   nir_def *lo;
+   nir_def *hi;
+   nir_def *size;
+};
+
+static struct pilot_buffer
+pilot_load_buffer(nir_builder *b, nir_def *handle, unsigned table,
+                  bool need_size, bool check_rack)
+{
+   nir_def *srt = nir_load_pilot_arg_pan(b, .base = 1);
+   nir_def *index = nir_iand_imm(b, handle, BITFIELD_MASK(24));
+
+   if (table == 62) {
+      nir_def *entry =
+         nir_iadd(b, srt, nir_u2u64(b, nir_ishl_imm(b, index, 4)));
+      nir_def *res = nir_load_global_constant(b, need_size ? 3 : 2, 32, entry,
+                                              .align_mul = 16);
+      return (struct pilot_buffer){
+         .lo = nir_channel(b, res, 0),
+         .hi = nir_iand_imm(b, nir_channel(b, res, 1), BITFIELD_MASK(24)),
+         .size = need_size ? nir_channel(b, res, 2) : NULL,
+      };
+   }
+
+   nir_def *rack = nir_load_global_constant(
+      b, check_rack ? 3 : 2, 32, nir_iadd_imm(b, srt, table * 16),
+      .align_mul = 16);
+   nir_def *rack_hi =
+      nir_iand_imm(b, nir_channel(b, rack, 1), BITFIELD_MASK(24));
+   if (check_rack) {
+      nir_def *end = nir_iadd_imm(b, nir_ishl_imm(b, index, 5), 32);
+      rack_hi = nir_bcsel(b, nir_uge(b, nir_channel(b, rack, 2), end), rack_hi,
+                          nir_imm_int(b, PILOT_SINK_ADDRESS_HI));
+   }
+   nir_def *rack_addr =
+      nir_pack_64_2x32_split(b, nir_channel(b, rack, 0), rack_hi);
+   nir_def *desc =
+      nir_iadd(b, rack_addr, nir_u2u64(b, nir_ishl_imm(b, index, 5)));
+   if (!need_size) {
+      nir_def *addr = nir_load_global_constant(b, 2, 32, nir_iadd_imm(b, desc, 8),
+                                               .align_mul = 32,
+                                               .align_offset = 8);
+      return (struct pilot_buffer){
+         .lo = nir_channel(b, addr, 0),
+         .hi = nir_channel(b, addr, 1),
+      };
+   }
+   nir_def *words = nir_load_global_constant(b, 4, 32, desc, .align_mul = 32);
+   return (struct pilot_buffer){
+      .lo = nir_channel(b, words, 2),
+      .hi = nir_channel(b, words, 3),
+      .size = nir_channel(b, words, 1),
+   };
+}
+
+static nir_def *
+pilot_buffer_address(nir_builder *b, struct pilot_buffer buf,
+                     nir_def *in_bounds)
+{
+   STATIC_ASSERT(((uint64_t)PILOT_SINK_ADDRESS_HI << 32) &
+                 PAN_SHADER_OOB_ADDRESS);
+   nir_def *hi =
+      nir_bcsel(b, in_bounds, buf.hi, nir_imm_int(b, PILOT_SINK_ADDRESS_HI));
+   return nir_pack_64_2x32_split(b, buf.lo, hi);
+}
+
+static nir_def *
+pilot_load_bounded(nir_builder *b, struct pilot_buffer buf, nir_def *offset,
+                   unsigned num_components, unsigned bit_size)
+{
+   unsigned bytes = num_components * bit_size / 8;
+   nir_scalar off = nir_scalar_chase_movs(nir_get_scalar(offset, 0));
+   nir_def *in_bounds;
+
+   if (nir_scalar_is_const(off)) {
+      uint64_t end = nir_scalar_as_uint(off) + bytes;
+      in_bounds = end > UINT32_MAX
+                     ? nir_imm_false(b)
+                     : nir_uge(b, buf.size, nir_imm_int(b, end));
+   } else {
+      in_bounds =
+         nir_iand(b, nir_uge(b, buf.size, nir_imm_int(b, bytes)),
+                  nir_uge(b, nir_isub(b, buf.size, nir_imm_int(b, bytes)),
+                          offset));
+   }
+
+   nir_def *addr = nir_iadd(b, pilot_buffer_address(b, buf, in_bounds),
+                            nir_u2u64(b, offset));
+   return nir_load_global_constant(b, num_components, bit_size, addr,
+                                   .align_mul = bit_size / 8);
 }
 
 static bool
 lower_preamble(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
    struct preamble_ctx *ctx = data;
-   if (intr->intrinsic != nir_intrinsic_load_push_constant &&
-       intr->intrinsic != nir_intrinsic_store_preamble)
-      return false;
-
    b->cursor = nir_before_instr(&intr->instr);
-   nir_def *base = nir_load_push_constant(b, 1, 64, nir_imm_int(b, 0));
-   if (intr->intrinsic == nir_intrinsic_store_preamble) {
-      unsigned offset = (ctx->result_base + nir_intrinsic_base(intr)) * 4;
-      nir_store_global(b, intr->src[0].ssa, nir_iadd_imm(b, base, offset),
-                       .align_mul = 4);
-      nir_instr_remove(&intr->instr);
-   } else {
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_push_constant: {
       unsigned offset = nir_src_as_uint(intr->src[0]);
       assert(nir_intrinsic_base(intr) == 0);
       assert(offset + DIV_ROUND_UP(
@@ -287,38 +614,504 @@ lower_preamble(nir_builder *b, nir_intrinsic_instr *intr, void *data)
              ctx->inputs->fau.reserved * 4);
       nir_def *value = nir_load_global_constant(
          b, intr->def.num_components, intr->def.bit_size,
-         nir_iadd_imm(b, base, offset), .align_mul = 8,
+         nir_iadd_imm(b, nir_load_pilot_arg_pan(b, .base = 0), offset),
+         .align_mul = 8,
          .align_offset = offset % 8);
       nir_def_replace(&intr->def, value);
+      return true;
    }
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo: {
+      int table = pilot_handle_table(intr->src[0].ssa);
+      assert(table >= 0);
+      struct pilot_buffer buf =
+         pilot_load_buffer(b, intr->src[0].ssa, table, true, false);
+      nir_def *value =
+         pilot_load_bounded(b, buf, intr->src[1].ssa, intr->def.num_components,
+                            intr->def.bit_size);
+      nir_def_replace(&intr->def, value);
+      return true;
+   }
+   case nir_intrinsic_load_ssbo_address: {
+      int table = pilot_handle_table(intr->src[0].ssa);
+      assert(table >= 0);
+      bool null_check = ctx->inputs->robust_descriptors;
+      struct pilot_buffer buf =
+         pilot_load_buffer(b, intr->src[0].ssa, table, null_check, true);
+      nir_def *addr =
+         null_check ? pilot_buffer_address(b, buf, nir_ine_imm(b, buf.size, 0))
+                    : nir_pack_64_2x32_split(b, buf.lo, buf.hi);
+      nir_scalar off = nir_scalar_chase_movs(nir_get_scalar(intr->src[1].ssa, 0));
+      if (!nir_scalar_is_const(off) || nir_scalar_as_uint(off) != 0)
+         addr = nir_iadd(b, addr, nir_u2u64(b, intr->src[1].ssa));
+      nir_def_replace(&intr->def, addr);
+      return true;
+   }
+   default:
+      return false;
+   }
+}
+
+static nir_shader *
+pilot_create(const nir_shader *nir, nir_function **func)
+{
+   nir_shader *pilot =
+      nir_shader_create(NULL, MESA_SHADER_COMPUTE, nir->options);
+   pilot->info.internal = true;
+   pilot->info.float_controls_execution_mode =
+      nir->info.float_controls_execution_mode;
+   pilot->info.workgroup_size[0] = 1;
+   pilot->info.workgroup_size[1] = 1;
+   pilot->info.workgroup_size[2] = 1;
+   pilot->info.num_ubos = nir->info.num_ubos;
+   *func = nir_function_create(pilot, "main");
+   (*func)->is_entrypoint = true;
+   return pilot;
+}
+
+static bool
+pilot_vectorize_cb(unsigned align_mul, unsigned align_offset,
+                   unsigned bit_size, unsigned num_components,
+                   int64_t hole_size, nir_intrinsic_instr *low,
+                   nir_intrinsic_instr *high, void *data)
+{
+   return hole_size <= 0 && num_components <= 4 &&
+          num_components * bit_size <= 128;
+}
+
+static void
+pilot_optimize(nir_shader *pilot)
+{
+   const nir_load_store_vectorize_options opts = {
+      .modes = nir_var_mem_global,
+      .callback = pilot_vectorize_cb,
+   };
+
+   NIR_PASS(_, pilot, nir_opt_copy_prop);
+   NIR_PASS(_, pilot, nir_opt_constant_folding);
+   NIR_PASS(_, pilot, nir_opt_cse);
+   NIR_PASS(_, pilot, nir_opt_load_store_vectorize, &opts);
+   NIR_PASS(_, pilot, nir_opt_copy_prop);
+   NIR_PASS(_, pilot, nir_opt_cse);
+   NIR_PASS(_, pilot, nir_opt_dce);
+   nir_shader_gather_info(pilot, nir_shader_get_entrypoint(pilot));
+   nir_validate_shader(pilot, "preamble pilot");
+}
+
+struct buffer_base {
+   uint32_t handle;
+   uint32_t weight;
+   bool ubo;
+   nir_def *def;
+   nir_def *size;
+};
+
+struct buffer_bases {
+   struct buffer_base *bases;
+   unsigned count;
+   nir_variable_mode modes;
+   struct hash_table *range_ht;
+};
+
+static nir_variable_mode
+buffer_base_modes(const struct pan_compile_inputs *inputs)
+{
+   if (pan_arch(inputs->gpu_id) != 15)
+      return 0;
+
+   return (nir_var_mem_ssbo | nir_var_mem_ubo) & ~inputs->robust_modes;
+}
+
+static unsigned
+buffer_base_words(const struct buffer_base *base)
+{
+   return base->ubo ? 4 : 2;
+}
+
+static bool
+buffer_access_handle(const nir_intrinsic_instr *intr, nir_variable_mode modes,
+                     uint32_t *handle)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_load_ssbo_address:
+      if (!(modes & nir_var_mem_ssbo))
+         return false;
+      break;
+   case nir_intrinsic_load_ubo:
+      if (!(modes & nir_var_mem_ubo) || nir_src_is_const(intr->src[1]))
+         return false;
+      break;
+   default:
+      return false;
+   }
+
+   if (!nir_src_is_const(intr->src[0]))
+      return false;
+
+   *handle = nir_src_as_uint(intr->src[0]);
+   return (*handle >> 24) < 64;
+}
+
+static int
+compare_buffer_base(const void *a, const void *b)
+{
+   const struct buffer_base *x = a, *y = b;
+   if (x->weight != y->weight)
+      return x->weight > y->weight ? -1 : 1;
+   if (x->ubo != y->ubo)
+      return x->ubo ? 1 : -1;
+   return (x->handle > y->handle) - (x->handle < y->handle);
+}
+
+static void
+collect_buffer_bases(nir_function_impl *impl, nir_variable_mode modes,
+                     struct util_dynarray *bases)
+{
+   nir_foreach_block(block, impl) {
+      uint32_t weight = 1u << MIN2(4 * block_loop_depth(block), 24);
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         uint32_t handle;
+         if (!buffer_access_handle(intr, modes, &handle))
+            continue;
+         bool ubo = intr->intrinsic == nir_intrinsic_load_ubo;
+         struct buffer_base *base = NULL;
+         util_dynarray_foreach(bases, struct buffer_base, it) {
+            if (it->handle == handle && it->ubo == ubo)
+               base = it;
+         }
+         if (!base) {
+            struct buffer_base entry = {.handle = handle, .ubo = ubo};
+            util_dynarray_append_typed(bases, struct buffer_base, entry);
+            base = util_dynarray_last_ptr(bases, struct buffer_base);
+         }
+         base->weight = MIN2((uint64_t)base->weight + weight, UINT32_MAX);
+      }
+   }
+
+   unsigned count = util_dynarray_num_elements(bases, struct buffer_base);
+   if (count > 1)
+      qsort(util_dynarray_begin(bases), count, sizeof(struct buffer_base),
+            compare_buffer_base);
+}
+
+static bool
+add_imm_no_wrap(nir_builder *b, struct hash_table *range_ht, nir_scalar add,
+                nir_scalar x, uint32_t imm)
+{
+   return nir_def_as_alu(add.def)->no_unsigned_wrap ||
+          nir_unsigned_upper_bound(b->shader, range_ht, x) <= UINT32_MAX - imm;
+}
+
+static nir_def *
+buffer_address(nir_builder *b, struct hash_table *range_ht, nir_def *base,
+               nir_def *offset, unsigned shift, unsigned align_offset,
+               bool fold_imm)
+{
+   nir_scalar s = nir_scalar_chase_movs(nir_get_scalar(offset, 0));
+   if (nir_scalar_is_const(s)) {
+      uint32_t bytes = (uint32_t)(nir_scalar_as_uint(s) << shift);
+      return nir_iadd_imm(b, base, bytes);
+   }
+
+   nir_def *rest = shift ? nir_ishl_imm(b, offset, shift) : offset;
+   unsigned fold = 0;
+   if (!shift && nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_iadd) {
+      for (unsigned i = 0; i < 2; i++) {
+         nir_scalar c = nir_scalar_chase_alu_src(s, i);
+         if (!nir_scalar_is_const(c))
+            continue;
+         nir_scalar x = nir_scalar_chase_alu_src(s, 1 - i);
+         uint32_t imm = (uint32_t)nir_scalar_as_uint(c);
+         nir_def *xd = nir_channel(b, x.def, x.comp);
+         if (fold_imm && imm <= INT16_MAX &&
+             add_imm_no_wrap(b, range_ht, s, x, imm)) {
+            rest = xd;
+            fold = imm;
+         } else if (align_offset > 0 && align_offset <= INT16_MAX) {
+            uint32_t delta = imm - align_offset;
+            rest = delta ? nir_iadd_imm(b, xd, delta) : xd;
+            fold = align_offset;
+         }
+         break;
+      }
+   }
+
+   nir_def *zext = nir_pack_64_2x32_split(b, rest, nir_imm_int(b, 0));
+   nir_def *addr = nir_iadd(b, base, zext);
+   return fold ? nir_iadd_imm(b, addr, fold) : addr;
+}
+
+static unsigned
+address_user_align_offset(nir_def *def)
+{
+   if (!list_is_singular(&def->uses))
+      return 0;
+
+   nir_src *use = list_first_entry(&def->uses, nir_src, use_link);
+   if (nir_src_is_if(use) ||
+       nir_src_use_instr(use)->type != nir_instr_type_intrinsic)
+      return 0;
+
+   nir_intrinsic_instr *user = nir_instr_as_intrinsic(nir_src_use_instr(use));
+   switch (user->intrinsic) {
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_constant:
+      return use == &user->src[0] ? nir_intrinsic_align_offset(user) : 0;
+   case nir_intrinsic_store_global:
+      return use == &user->src[1] ? nir_intrinsic_align_offset(user) : 0;
+   default:
+      return 0;
+   }
+}
+
+static bool
+address_user_folds_offset(nir_def *def)
+{
+   if (!list_is_singular(&def->uses))
+      return false;
+
+   nir_src *use = list_first_entry(&def->uses, nir_src, use_link);
+   if (nir_src_is_if(use) ||
+       nir_src_use_instr(use)->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *user = nir_instr_as_intrinsic(nir_src_use_instr(use));
+   switch (user->intrinsic) {
+   case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_constant:
+      return use == &user->src[0];
+   case nir_intrinsic_store_global:
+      return use == &user->src[1];
+   default:
+      return false;
+   }
+}
+
+static bool
+split_buffer_load(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   uint32_t handle;
+   if (intr->intrinsic != nir_intrinsic_load_ssbo ||
+       !buffer_access_handle(intr, nir_var_mem_ssbo, &handle) ||
+       ((nir_intrinsic_access(intr) & ACCESS_CAN_REORDER) &&
+        !(nir_intrinsic_access(intr) & ACCESS_VOLATILE)))
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *offset = intr->src[1].ssa;
+   if (nir_intrinsic_offset_shift(intr))
+      offset = nir_ishl_imm(b, offset, nir_intrinsic_offset_shift(intr));
+   nir_def *addr = nir_load_ssbo_address(b, 1, 64, intr->src[0].ssa, offset);
+   nir_def *value = nir_load_global(
+      b, intr->def.num_components, intr->def.bit_size, addr,
+      .access = nir_intrinsic_access(intr),
+      .align_mul = nir_intrinsic_align_mul(intr),
+      .align_offset = nir_intrinsic_align_offset(intr));
+   nir_def_replace(&intr->def, value);
    return true;
+}
+
+static const struct buffer_base *
+buffer_base_find(const struct buffer_bases *bb, uint32_t handle, bool ubo)
+{
+   for (unsigned i = 0; i < bb->count; i++) {
+      if (bb->bases[i].handle == handle && bb->bases[i].ubo == ubo)
+         return &bb->bases[i];
+   }
+   return NULL;
+}
+
+static nir_def *
+buffer_base_def(const struct buffer_bases *bb, uint32_t handle)
+{
+   const struct buffer_base *base = buffer_base_find(bb, handle, false);
+   return base ? base->def : NULL;
+}
+
+static bool
+restore_split_load(nir_builder *b, nir_intrinsic_instr *load,
+                   const struct buffer_bases *bb)
+{
+   nir_instr *src = nir_def_instr(load->src[0].ssa);
+   if (src->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *addr = nir_instr_as_intrinsic(src);
+   uint32_t handle;
+   if (addr->intrinsic != nir_intrinsic_load_ssbo_address ||
+       !buffer_access_handle(addr, bb->modes, &handle) ||
+       buffer_base_def(bb, handle) ||
+       !list_is_singular(&addr->def.uses))
+      return false;
+
+   b->cursor = nir_before_instr(&load->instr);
+   nir_def *value = nir_load_ssbo(
+      b, load->def.num_components, load->def.bit_size, addr->src[0].ssa,
+      addr->src[1].ssa, .access = nir_intrinsic_access(load),
+      .align_mul = nir_intrinsic_align_mul(load),
+      .align_offset = nir_intrinsic_align_offset(load));
+   nir_def_replace(&load->def, value);
+   nir_instr_remove(&addr->instr);
+   return true;
+}
+
+static bool
+rewrite_buffer_access(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct buffer_bases *bb = data;
+   if (intr->intrinsic == nir_intrinsic_load_global)
+      return restore_split_load(b, intr, bb);
+
+   uint32_t handle;
+   if (!buffer_access_handle(intr, bb->modes, &handle))
+      return false;
+
+   if (intr->intrinsic == nir_intrinsic_load_ubo) {
+      const struct buffer_base *ubo = buffer_base_find(bb, handle, true);
+      if (!ubo)
+         return false;
+
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def *value = nir_load_global_constant_bounded(
+         b, intr->def.num_components, intr->def.bit_size, ubo->def,
+         intr->src[1].ssa, ubo->size,
+         .access = nir_intrinsic_access(intr) | ACCESS_CAN_REORDER,
+         .align_mul = nir_intrinsic_align_mul(intr),
+         .align_offset = nir_intrinsic_align_offset(intr));
+      nir_def_replace(&intr->def, value);
+      return true;
+   }
+
+   nir_def *base = buffer_base_def(bb, handle);
+   if (!base)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   if (intr->intrinsic == nir_intrinsic_load_ssbo_address) {
+      nir_def_replace(&intr->def,
+                      buffer_address(b, bb->range_ht, base, intr->src[1].ssa,
+                                     0, address_user_align_offset(&intr->def),
+                                     address_user_folds_offset(&intr->def)));
+      return true;
+   }
+
+   nir_def *addr = buffer_address(b, bb->range_ht, base, intr->src[1].ssa,
+                                  nir_intrinsic_offset_shift(intr),
+                                  nir_intrinsic_align_offset(intr), true);
+   nir_def *value = nir_load_global(
+      b, intr->def.num_components, intr->def.bit_size, addr,
+      .access = nir_intrinsic_access(intr),
+      .align_mul = nir_intrinsic_align_mul(intr),
+      .align_offset = nir_intrinsic_align_offset(intr));
+   nir_def_replace(&intr->def, value);
+   return true;
+}
+
+#define PILOT_FAU_PAGE_WORDS 128
+
+static unsigned
+buffer_base_room(nir_function_impl *main, unsigned storage,
+                 unsigned result_base, unsigned max_push)
+{
+   unsigned used = 0;
+   bool wide = false;
+   if (main->preamble) {
+      nir_foreach_block(block, main->preamble->impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic ||
+                nir_instr_as_intrinsic(instr)->intrinsic !=
+                   nir_intrinsic_store_preamble)
+               continue;
+            nir_def *value = nir_instr_as_intrinsic(instr)->src[0].ssa;
+            unsigned size =
+               DIV_ROUND_UP(value->num_components * value->bit_size, 32);
+            used += size >= 2 ? ALIGN_POT(size, 2) : size;
+            wide |= size > 2;
+         }
+      }
+   }
+
+   used = ALIGN_POT(used, 2);
+   for (unsigned page = PILOT_FAU_PAGE_WORDS; wide && page < max_push;
+        page += PILOT_FAU_PAGE_WORDS) {
+      if (result_base < page)
+         used += 4;
+   }
+   return storage > used ? storage - used : 0;
+}
+
+static unsigned
+pilot_emit_buffer_bases(nir_shader *pilot, nir_function_impl *main,
+                        struct buffer_bases *bb, unsigned first)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(pilot);
+   nir_builder pb = nir_builder_at(nir_after_impl(impl));
+   nir_builder mb = nir_builder_at(nir_before_impl(main));
+
+   unsigned base = first;
+   for (unsigned i = 0; i < bb->count; i++) {
+      uint32_t handle = bb->bases[i].handle;
+      if (bb->bases[i].ubo) {
+         struct pilot_buffer buf = pilot_load_buffer(
+            &pb, nir_imm_int(&pb, handle), handle >> 24, true, false);
+         nir_store_preamble(&pb, nir_pack_64_2x32_split(&pb, buf.lo, buf.hi),
+                            .base = base);
+         nir_store_preamble(&pb, buf.size, .base = base + 2);
+         bb->bases[i].def = nir_load_preamble(&mb, 1, 64, .base = base);
+         bb->bases[i].size = nir_load_preamble(&mb, 1, 32, .base = base + 2);
+      } else {
+         nir_def *addr = nir_load_ssbo_address(
+            &pb, 1, 64, nir_imm_int(&pb, handle), nir_imm_int(&pb, 0));
+         nir_store_preamble(&pb, addr, .base = base);
+         bb->bases[i].def = nir_load_preamble(&mb, 1, 64, .base = base);
+      }
+      base += buffer_base_words(&bb->bases[i]);
+   }
+
+   nir_progress(true, impl, nir_metadata_none);
+   return base;
 }
 
 nir_shader *
 pan_nir_opt_preamble(nir_shader *nir, const struct pan_compile_inputs *inputs,
-                     nir_shader **preamble, unsigned *fau_words)
+                     nir_shader **preamble, struct pan_fau_virtual *virt)
 {
    *preamble = NULL;
-   *fau_words = inputs->fau.reserved;
-   if (inputs->fau.reserved >= PAN_MAX_PUSH)
+   unsigned max_push = pan_max_push(inputs->gpu_id, inputs->gpu_variant);
+   if (inputs->fau.reserved >= max_push)
       return NULL;
 
    nir_shader *clone = nir_shader_clone(NULL, nir);
    nir_function_impl *main = nir_shader_get_entrypoint(clone);
+   nir_variable_mode buffer_modes = buffer_base_modes(inputs);
+   bool buffer_addresses = buffer_modes & nir_var_mem_ssbo;
+   if (buffer_addresses)
+      NIR_PASS(_, clone, nir_shader_intrinsics_pass, split_buffer_load,
+               nir_metadata_control_flow, NULL);
+   struct preamble_ctx branch_ctx = {
+      .inputs = inputs,
+      .buffer_addresses = buffer_addresses,
+   };
+   prepare_uniform_branches(clone, &branch_ctx);
    nir_index_ssa_defs(main);
    struct preamble_ctx ctx = {
       .inputs = inputs,
       .result_base = ALIGN_POT(inputs->fau.reserved, 2),
       .allowed = calloc(main->ssa_alloc, 1),
+      .buffer_addresses = buffer_addresses,
    };
    if (!ctx.allowed) {
       ralloc_free(clone);
       return NULL;
    }
-   mark_speculatable_uniform_loads(main, &ctx);
    unsigned ubo_words = count_pushable_ubo_words(main, &ctx);
-   unsigned available = PAN_MAX_PUSH - ctx.result_base;
-   ctx.fau_pressure = (ctx.result_base + ubo_words) * 4 > PAN_MAX_PUSH * 3;
+   unsigned available = max_push - ctx.result_base;
+   ctx.fau_pressure = (ctx.result_base + ubo_words) * 4 > max_push * 3;
+   mark_speculatable_uniform_loads(main, &ctx);
    unsigned storage = ctx.fau_pressure ? available :
                       available - MIN2(ubo_words, available);
    if (!storage) {
@@ -337,69 +1130,243 @@ pan_nir_opt_preamble(nir_shader *nir, const struct pan_compile_inputs *inputs,
    unsigned size[nir_preamble_num_classes] = {0};
    bool progress = nir_opt_preamble(clone, &opts, size);
    free(ctx.allowed);
-   if (!progress) {
+
+   struct util_dynarray bases;
+   util_dynarray_init(&bases, NULL);
+   unsigned first = ALIGN_POT(size[0], 2);
+   struct buffer_bases bb = {.modes = buffer_modes};
+   unsigned room = buffer_modes ? buffer_base_room(main, storage,
+                                                   ctx.result_base, max_push)
+                                : 0;
+   if (room >= 2) {
+      collect_buffer_bases(main, buffer_modes, &bases);
+      bb.bases = util_dynarray_begin(&bases);
+      unsigned total = util_dynarray_num_elements(&bases, struct buffer_base);
+      unsigned used = 0;
+      for (unsigned i = 0; i < total; i++) {
+         unsigned words = buffer_base_words(&bb.bases[i]);
+         if (used + words > room)
+            break;
+         used += words;
+         bb.count = i + 1;
+      }
+   }
+
+   if (!progress && !bb.count) {
+      util_dynarray_fini(&bases);
       ralloc_free(clone);
       return NULL;
    }
 
-   nir_shader *pilot =
-      nir_shader_create(NULL, MESA_SHADER_COMPUTE, nir->options);
-   pilot->info.internal = true;
-   pilot->info.float_controls_execution_mode =
-      nir->info.float_controls_execution_mode;
-   pilot->info.workgroup_size[0] = 1;
-   pilot->info.workgroup_size[1] = 1;
-   pilot->info.workgroup_size[2] = 1;
-   pilot->info.num_ubos = nir->info.num_ubos;
+   nir_function *func;
+   nir_shader *pilot = pilot_create(nir, &func);
    if (nir->constant_data_size) {
       pilot->constant_data = ralloc_size(pilot, nir->constant_data_size);
       memcpy(pilot->constant_data, nir->constant_data, nir->constant_data_size);
       pilot->constant_data_size = nir->constant_data_size;
    }
-   nir_function *func = nir_function_create(pilot, "main");
-   func->is_entrypoint = true;
-   func->impl = nir_function_impl_clone(pilot, main->preamble->impl);
-   func->impl->function = func;
-   nir_foreach_block(block, func->impl)
-   {
-      nir_if *nif = nir_block_get_following_if(block);
-      if (nif)
-         nif->control = nir_selection_control_dont_flatten;
-      nir_foreach_instr(instr, block) {
-         if (instr->type != nir_instr_type_intrinsic)
-            continue;
-         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         switch (intr->intrinsic) {
-         case nir_intrinsic_load_push_constant:
-         case nir_intrinsic_load_ubo:
-         case nir_intrinsic_load_constant:
-         case nir_intrinsic_load_global_constant:
-         case nir_intrinsic_load_ssbo:
-         case nir_intrinsic_store_preamble:
-            break;
-         default:
-            ralloc_free(pilot);
-            ralloc_free(clone);
-            return NULL;
+   if (progress) {
+      func->impl = nir_function_impl_clone(pilot, main->preamble->impl);
+      func->impl->function = func;
+      nir_foreach_block(block, func->impl)
+      {
+         nir_if *nif = nir_block_get_following_if(block);
+         if (nif)
+            nif->control = nir_selection_control_dont_flatten;
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+            switch (intr->intrinsic) {
+            case nir_intrinsic_load_push_constant:
+            case nir_intrinsic_load_ubo:
+            case nir_intrinsic_load_constant:
+            case nir_intrinsic_load_global_constant:
+            case nir_intrinsic_load_ssbo:
+            case nir_intrinsic_load_ssbo_address:
+            case nir_intrinsic_store_preamble:
+               break;
+            default:
+               util_dynarray_fini(&bases);
+               ralloc_free(pilot);
+               ralloc_free(clone);
+               return NULL;
+            }
          }
       }
+      exec_node_remove(&main->preamble->node);
+      main->preamble = NULL;
+   } else {
+      nir_function_impl_create(func);
    }
-   exec_node_remove(&main->preamble->node);
-   main->preamble = NULL;
 
-   NIR_PASS(_, clone, nir_shader_intrinsics_pass, lower_main,
-            nir_metadata_control_flow, &ctx);
+   unsigned slots = size[0];
+   if (bb.count)
+      slots = pilot_emit_buffer_bases(pilot, main, &bb, first);
+   if (buffer_modes) {
+      bb.range_ht = _mesa_pointer_hash_table_create(NULL);
+      NIR_PASS(_, clone, nir_shader_intrinsics_pass, rewrite_buffer_access,
+               nir_metadata_control_flow, &bb);
+      _mesa_hash_table_destroy(bb.range_ht, NULL);
+   }
+   if (bb.count)
+      NIR_PASS(_, clone, nir_opt_cse);
+   util_dynarray_fini(&bases);
+
    NIR_PASS(_, pilot, nir_shader_intrinsics_pass, lower_preamble,
             nir_metadata_control_flow, &ctx);
-   NIR_PASS(_, clone, nir_opt_dce);
    NIR_PASS(_, pilot, nir_opt_copy_prop);
    NIR_PASS(_, pilot, nir_opt_constant_folding);
    NIR_PASS(_, pilot, nir_opt_cse);
+
+   bool cf_progress;
+   do {
+      cf_progress = false;
+      NIR_PASS(cf_progress, clone, nir_opt_dce);
+      NIR_PASS(cf_progress, clone, nir_opt_dead_cf);
+   } while (cf_progress);
+   prune_pilot_outputs(clone, pilot, slots);
    NIR_PASS(_, pilot, nir_opt_dce);
-   nir_shader_gather_info(pilot, func->impl);
+   bool live_outputs = false;
+   nir_foreach_block(block, nir_shader_get_entrypoint(pilot)) {
+      nir_foreach_instr(instr, block) {
+         live_outputs |= instr->type == nir_instr_type_intrinsic &&
+                         nir_instr_as_intrinsic(instr)->intrinsic ==
+                            nir_intrinsic_store_preamble;
+      }
+   }
+   if (!live_outputs) {
+      ralloc_free(pilot);
+      ralloc_free(clone);
+      return NULL;
+   }
+
+   int16_t *value_of_base = malloc(MAX2(slots, 1) * sizeof(int16_t));
+   if (!value_of_base) {
+      ralloc_free(pilot);
+      ralloc_free(clone);
+      return NULL;
+   }
+   memset(value_of_base, 0xff, MAX2(slots, 1) * sizeof(int16_t));
+   struct pilot_values pv = {
+      .virt = virt,
+      .value_of_base = value_of_base,
+   };
+   register_pilot_values(pilot, &pv);
+   NIR_PASS(_, clone, nir_shader_intrinsics_pass, rebase_main_load,
+            nir_metadata_control_flow, &pv);
+   free(value_of_base);
+
+   NIR_PASS(_, clone, nir_opt_dce);
    nir_validate_shader(clone, "preamble main");
    nir_validate_shader(pilot, "preamble pilot");
    *preamble = pilot;
-   *fau_words = ALIGN_POT(ctx.result_base + size[0], 2);
    return clone;
+}
+
+static bool
+place_pilot_store(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct pan_fau_virtual *virt = data;
+   if (intr->intrinsic != nir_intrinsic_store_preamble)
+      return false;
+
+   const struct pan_fau_value *value = &virt->values[nir_intrinsic_base(intr)];
+   assert(value->alias < 0 && virt->map[value->word] >= 0);
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_store_global(b, intr->src[0].ssa,
+                    nir_iadd_imm(b, nir_load_pilot_arg_pan(b, .base = 0),
+                                 virt->map[value->word] * 4),
+                    .align_mul = 4);
+   nir_instr_remove(&intr->instr);
+   return true;
+}
+
+void
+pan_nir_pilot_place_results(nir_shader *pilot,
+                            const struct pan_fau_virtual *virt)
+{
+   assert(virt->placed);
+   NIR_PASS(_, pilot, nir_shader_intrinsics_pass, place_pilot_store,
+            nir_metadata_control_flow, (void *)virt);
+   pilot_optimize(pilot);
+}
+
+struct pilot_copy_run {
+   unsigned key;
+   unsigned word;
+   unsigned offset;
+   unsigned count;
+};
+
+static void
+pilot_emit_fau_copies(nir_builder *b, const struct pan_fau_layout *fau)
+{
+   struct pilot_copy_run runs[PAN_MAX_PUSH];
+   unsigned run_count = 0;
+
+   pan_fau_foreach_reloc(fau, i) {
+      struct pan_ubo_relocation reloc = fau->words[i].relocation;
+      struct pilot_copy_run *last = run_count ? &runs[run_count - 1] : NULL;
+
+      if (last && last->key == reloc.ubo && last->count < 4 &&
+          last->word + last->count == i &&
+          last->offset + 4 * last->count == reloc.offset &&
+          (last->offset & ~15) == (reloc.offset & ~15)) {
+         last->count++;
+      } else {
+         runs[run_count++] = (struct pilot_copy_run){
+            .key = reloc.ubo,
+            .word = i,
+            .offset = reloc.offset,
+            .count = 1,
+         };
+      }
+   }
+
+   nir_def *fau_base = nir_load_pilot_arg_pan(b, .base = 0);
+
+   for (unsigned r = 0; r < run_count; r++) {
+      const unsigned table = pan_ubo_reloc_table(runs[r].key);
+      const unsigned index = pan_ubo_reloc_index(runs[r].key);
+      struct pilot_buffer buf =
+         pilot_load_buffer(b, nir_imm_int(b, pan_res_handle(table, index)),
+                           table, true, false);
+      nir_def *chunk_end = nir_imm_int(b, (runs[r].offset & ~15) + 16);
+      nir_def *addr =
+         pilot_buffer_address(b, buf, nir_uge(b, buf.size, chunk_end));
+      nir_def *value = nir_load_global_constant(
+         b, runs[r].count, 32, nir_iadd_imm(b, addr, runs[r].offset),
+         .align_mul = 4);
+      nir_store_global(b, value, nir_iadd_imm(b, fau_base, runs[r].word * 4),
+                       .align_mul = 4);
+   }
+}
+
+bool
+pan_nir_pilot_add_fau_copies(nir_shader **pilot, const nir_shader *nir,
+                             const struct pan_fau_layout *fau)
+{
+   bool has_relocs = false;
+   pan_fau_foreach_reloc(fau, i) {
+      has_relocs = true;
+      break;
+   }
+
+   if (!has_relocs)
+      return false;
+
+   if (!*pilot) {
+      nir_function *func;
+      *pilot = pilot_create(nir, &func);
+      nir_function_impl_create(func);
+   }
+
+   nir_function_impl *impl = nir_shader_get_entrypoint(*pilot);
+   nir_builder b = nir_builder_at(nir_after_impl(impl));
+   pilot_emit_fau_copies(&b, fau);
+   nir_progress(true, impl, nir_metadata_none);
+   pilot_optimize(*pilot);
+   return true;
 }

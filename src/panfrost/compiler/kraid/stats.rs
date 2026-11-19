@@ -34,6 +34,7 @@ pub fn exec_class(model: &dyn Model, op: &Op) -> Option<ExecClass> {
             | Op::LeaPka(_)
             | Op::LeaTex(_)
             | Op::LdAttr(_)
+            | Op::LdChecked(_)
             | Op::LdCvt(_)
             | Op::LdGClk(_)
             | Op::LdPka(_)
@@ -41,6 +42,8 @@ pub fn exec_class(model: &dyn Model, op: &Op) -> Option<ExecClass> {
             | Op::LdTex(_)
             | Op::LeaTensor(_)
             | Op::Load(_)
+            | Op::LdMulti(_)
+            | Op::StMulti(_)
             | Op::StChecked(_)
             | Op::StCvt(_)
             | Op::Store(_) => ExecClass::LoadStore,
@@ -52,7 +55,8 @@ pub fn exec_class(model: &dyn Model, op: &Op) -> Option<ExecClass> {
             | Op::LdVarBufFlat(_)
             | Op::LdVarFlat(_)
             | Op::LdVarSpecial(_) => ExecClass::Varying,
-            Op::TexFetch(_)
+            Op::TexDual(_)
+            | Op::TexFetch(_)
             | Op::TexGather(_)
             | Op::TexGradient(_)
             | Op::TexSingle(_) => ExecClass::Texture,
@@ -121,7 +125,8 @@ impl VaStatCount {
             }
         }
 
-        if matches!(&instr.op, Op::BlendCall(_)) {
+        if matches!(&instr.op, Op::BlendCall(_) | Op::PilotJump(_)
+                    | Op::RtCall(_) | Op::RtReturn(_)) {
             // This will get lowered later into a BLEND + prologue, both
             // should not be counted in the stats metrics
             return;
@@ -151,7 +156,13 @@ impl VaStatCount {
                 };
                 self.v += f32::from(total_bytes.div_ceil(4));
             }
-            Some(ExecClass::Texture) => self.t += 1.0,
+            Some(ExecClass::Texture) => {
+                self.t += if matches!(&instr.op, Op::TexDual(_)) {
+                    2.0
+                } else {
+                    1.0
+                };
+            }
             None => (),
         }
 
@@ -301,6 +312,22 @@ fn get_va_stats(s: &Shader, alloca_bytes: u32) -> valhall_stats {
 }
 
 impl Shader<'_> {
+    pub fn spill_aware_cost(&self) -> u64 {
+        let mut cost = 0u64;
+        for (bi, block) in self.blocks.iter().enumerate() {
+            let per_spill_cost = u64::from(per_spill_cost(self, bi));
+            for instr in &block.instrs {
+                cost += 1;
+                match &instr.op {
+                    Op::Load(op) if op.is_tls => cost += per_spill_cost,
+                    Op::Store(op) if op.is_tls => cost += per_spill_cost,
+                    _ => (),
+                }
+            }
+        }
+        cost
+    }
+
     pub fn get_stats(&self, alloca_bytes: u32) -> pan_stats {
         if DEBUG.contains(DebugFlags::PRINT) {
             report_stats_per_instr(self);

@@ -123,11 +123,39 @@ void main() { result=texture(sampler2D(image,image_sampler),uv); }
 layout(location=0) out vec4 result;
 void main() { result=vec4(gl_FragCoord.z,gl_FragCoord.w,gl_PointCoord); }
 """)
+    fifth_gen = ["Mali-G2-Ultra"]
     targets = ["Mali-G57", "Mali-G68", "Mali-G610", "Mali-G710",
-               "Mali-G310v1", "Mali-G310v5", "Mali-G615", "Mali-G715"]
+               "Mali-G310v1", "Mali-G310v5", "Mali-G615", "Mali-G715"] + fifth_gen
     for target in targets:
         for spv in [compute, vertex, fragment]:
             compile_shader(root, spv, target + spv.suffixes[0], "-c", target)
+    ray_query = fixture(root, "rayquery.comp", """#version 460
+#extension GL_EXT_ray_query : require
+layout(local_size_x=64) in;
+layout(set=3,binding=18) uniform accelerationStructureEXT tlas[2];
+layout(set=0,binding=1) buffer Out { vec4 hits[]; };
+void main() {
+  rayQueryEXT rq;
+  rayQueryInitializeEXT(rq, tlas[1], 0, 0xff, vec3(0), 0.0, vec3(0,0,1), 1e30);
+  while (rayQueryProceedEXT(rq)) {
+    if (rayQueryGetIntersectionTypeEXT(rq, false) ==
+        gl_RayQueryCandidateIntersectionTriangleEXT)
+      rayQueryConfirmIntersectionEXT(rq);
+  }
+  hits[gl_GlobalInvocationID.x] =
+    vec4(rayQueryGetIntersectionTEXT(rq, true),
+         float(rayQueryGetIntersectionTypeEXT(rq, true)),
+         rayQueryGetIntersectionBarycentricsEXT(rq, true));
+}
+""")
+    ray_query_report = compile_shader(root, ray_query, "rayquery", "-c", "Mali-G2-Ultra")
+    assert {"set": 3, "binding": 18, "type": 1000150000, "count": 2,
+            "source": "NIR reflection"} in ray_query_report["bindings"]
+    assert "RT_TRACE" in Path(str(root / "rayquery") + ".0.main.isa.txt").read_text()
+    compile_shader(root, ray_query, "rayquery-layout", "-c", "Mali-G2-Ultra",
+                   "--binding", "3:18:acceleration-structure:4")
+    for binding in ["3:18:uniform-buffer:2", "3:18:acceleration-structure:1"]:
+        run(ray_query, "-c", "Mali-G2-Ultra", "--binding", binding, success=False)
     fp16_source = """#version 450
 layout(local_size_x=32) in;
 layout(set=0,binding=0) buffer Data { vec4 data[]; } values;
@@ -220,9 +248,13 @@ void main() {
         assert not re.search(r"\.(?:v2)?f16\b", isa), isa
         isa = shader_isa(root, fp16_math, "math" + target, "-c", target)
         assert "FRCP.f16" in isa and "FRSQ.f16" in isa, isa
-        assert "FMIN.v2f16" in isa and "FMAX.v2f16" in isa, isa
+        assert ("FMIN.v2f16" in isa and "FMAX.v2f16" in isa) or \
+            "FCLAMP.v2f16" in isa, isa
         nir = Path(str(root / ("math" + target)) + ".0.main.nir.txt").read_text()
-        for op in ["fexp2", "flog2", "fpow", "fsin", "fcos"]:
+        wide = ["fsin", "fcos"]
+        if target not in fifth_gen:
+            wide += ["fexp2", "flog2", "fpow"]
+        for op in wide:
             assert re.search(r"32\s+%\d+ = " + op + r"\b", nir), nir
         isa = shader_isa(root, mixed, "mixed" + target, "-c", target)
         assert re.search(r"^FADD\.f32\S* r\d+,", isa, re.M), isa

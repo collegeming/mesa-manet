@@ -55,6 +55,7 @@ pub enum SpecialFAU {
     BlendDescriptor6,
     BlendDescriptor7,
     ThreadLocalPointer,
+    RtThreadLocalPointer,
     WorkgroupLocalPointer,
     ResourceTablePointer,
     LaneId,
@@ -91,7 +92,7 @@ impl fmt::Display for SpecialFAU {
             BlendDescriptor5 => "blend_descriptor5",
             BlendDescriptor6 => "blend_descriptor6",
             BlendDescriptor7 => "blend_descriptor7",
-            ThreadLocalPointer => "thread_local_pointer",
+            ThreadLocalPointer | RtThreadLocalPointer => "thread_local_pointer",
             WorkgroupLocalPointer => "workgroup_local_pointer",
             ResourceTablePointer => "resource_table_pointer",
             LaneId => "lane_id",
@@ -123,6 +124,8 @@ pub enum FAUPage {
 
     /// The small constant table
     SmallConst,
+
+    Virtual,
 }
 
 impl FAUPage {
@@ -191,6 +194,31 @@ impl FAURef {
             imm32: None,
         }
     }
+
+    pub fn user_i64_zext(idx: u16) -> Self {
+        assert!((idx % 2) == 0);
+        FAURef {
+            page: FAUPage::User,
+            idx: idx | 1,
+            special: None,
+            load64: true,
+            imm32: None,
+        }
+    }
+
+    pub fn is_zext(&self) -> bool {
+        self.load64 && (self.idx & 1) == 1
+    }
+
+    pub fn virtual_i32(idx: u16) -> Self {
+        FAURef {
+            page: FAUPage::Virtual,
+            idx,
+            special: None,
+            load64: false,
+            imm32: None,
+        }
+    }
 }
 
 impl fmt::Display for FAURef {
@@ -211,12 +239,15 @@ impl fmt::Display for FAURef {
                 FAUPage::Special0 => write!(f, "s0:{idx}")?,
                 FAUPage::Special1 => write!(f, "s1:{idx}")?,
                 FAUPage::Special3 => write!(f, "s3:{idx}")?,
+                FAUPage::Virtual => write!(f, "v{idx}")?,
                 FAUPage::SmallConst => panic!("Already handled"),
             }
         }
 
         if self.load64 {
-            debug_assert_eq!(w, 0);
+            if w == 1 {
+                write!(f, ".zext")?;
+            }
         } else {
             write!(f, ".w{w}")?;
         }
@@ -296,12 +327,45 @@ pub enum PreloadReg {
     BlendInputSrc1,
     /// Return address (where to jump when the blend shader finishes)
     BlendReturnAddr,
+
+    PilotFau,
+    PilotSrt,
+    RtFrame,
+    RtPayload,
+    RtRoot,
+    RtStack,
+    RtReturn,
+    RtRay,
+    RtRecord,
+    RtShaderRecord,
+    RtTmax,
+    RtHitKind,
+    RtDepth,
+    RtFrameLayout,
+    RtFrameOffset,
+    RtPayloadOffset,
+    RtRootOffset,
+    RtRayOffset,
+    RtLaunch0,
+    RtLaunch1,
+    RtLaunch2,
 }
 
 impl PreloadReg {
+    pub fn is_rt_arg(self) -> bool {
+        matches!(self, Self::RtFrame | Self::RtPayload | Self::RtRoot
+            | Self::RtStack | Self::RtReturn | Self::RtRay | Self::RtRecord
+            | Self::RtShaderRecord | Self::RtTmax | Self::RtHitKind
+            | Self::RtDepth | Self::RtFrameLayout | Self::RtFrameOffset
+            | Self::RtPayloadOffset | Self::RtRootOffset | Self::RtRayOffset
+            | Self::RtLaunch0 | Self::RtLaunch1 | Self::RtLaunch2)
+    }
+
     pub fn reg_size(&self) -> u8 {
         match self {
-            Self::FrameArg => 2,
+            Self::FrameArg | Self::PilotFau | Self::PilotSrt => 2,
+            Self::RtFrame | Self::RtPayload | Self::RtRoot | Self::RtStack
+            | Self::RtRay | Self::RtRecord | Self::RtShaderRecord => 2,
             Self::BlendInputSrc0 | Self::BlendInputSrc1 => 4,
             _ => 1,
         }
@@ -335,12 +399,33 @@ impl fmt::Display for PreloadReg {
             BlendInputSrc0 => "BLEND_IN_SRC0",
             BlendInputSrc1 => "BLEND_IN_SRC1",
             BlendReturnAddr => "BLEND_RETURN_ADDR",
+            PilotFau => "PILOT_FAU",
+            PilotSrt => "PILOT_SRT",
+            RtFrame => "RT_FRAME",
+            RtPayload => "RT_PAYLOAD",
+            RtRoot => "RT_ROOT",
+            RtStack => "RT_STACK",
+            RtReturn => "RT_RETURN",
+            RtRay => "RT_RAY",
+            RtRecord => "RT_RECORD",
+            RtShaderRecord => "RT_SHADER_RECORD",
+            RtTmax => "RT_TMAX",
+            RtHitKind => "RT_HIT_KIND",
+            RtDepth => "RT_DEPTH",
+            RtFrameLayout => "RT_FRAME_LAYOUT",
+            RtFrameOffset => "RT_FRAME_OFFSET",
+            RtPayloadOffset => "RT_PAYLOAD_OFFSET",
+            RtRootOffset => "RT_ROOT_OFFSET",
+            RtRayOffset => "RT_RAY_OFFSET",
+            RtLaunch0 => "RT_LAUNCH_0",
+            RtLaunch1 => "RT_LAUNCH_1",
+            RtLaunch2 => "RT_LAUNCH_2",
         };
         write!(f, "{name}")
     }
 }
 
-pub type PreloadRegSet = U8EnumSet<PreloadReg, 1>;
+pub type PreloadRegSet = U8EnumSet<PreloadReg, 2>;
 
 /// Handle referencing an external resource (e.g. sampler, texture, attribute,
 /// uniform buffer...).  It is just a pair of indices, one selecting a "table",
@@ -1951,7 +2036,7 @@ pub struct Instr {
 }
 
 impl Instr {
-    pub const MAX_SRC_COUNT: usize = 5;
+    pub const MAX_SRC_COUNT: usize = 18;
 }
 
 impl Deref for Instr {
@@ -2020,6 +2105,7 @@ impl LabelAllocator {
     }
 }
 
+#[derive(Clone)]
 pub struct BasicBlock {
     pub label: Label,
     pub instrs: Vec<Instr>,
@@ -2063,7 +2149,7 @@ impl BasicBlock {
 
     pub fn is_postlude_instr(instr: &Instr) -> bool {
         match &instr.op {
-            Op::Branch(_) | Op::PhiSrc(_) | Op::RegOut(_) => true,
+            Op::Branch(_) | Op::PhiSrc(_) | Op::RegOut(_) | Op::RtReturn(_) => true,
             Op::Nop(_) => instr.flow.get_end_shader(),
             _ => false,
         }
@@ -2186,6 +2272,15 @@ impl fmt::Display for BasicBlock {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HsrInfo {
+    pub ld_tile: bool,
+    pub ld_tile_lane_local: bool,
+    pub wait_or_tile_access_before_atest_zsemit: bool,
+    pub varying_before_atest_zsemit: bool,
+    pub centroid_interpolation: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ShaderInfo {
     /// Number of registers used
@@ -2204,6 +2299,15 @@ pub struct ShaderInfo {
     pub blend1_type: Option<DataType>,
     /// Is this a blend shader?
     pub is_blend: bool,
+    pub is_fragment: bool,
+    pub fixed_function_blend: u8,
+    pub hsr: HsrInfo,
+    pub cross_invocation: bool,
+    pub contains_jump_ex: bool,
+    pub rt_frame_size: u32,
+    pub rt_frame_prefix: u32,
+    pub rt_frame_tls: bool,
+    pub rt_frame_multi: bool,
 }
 
 impl ShaderInfo {
@@ -2217,12 +2321,14 @@ impl ShaderInfo {
 
 /// Constant data from nir_opt_large_constants, appended to the shader
 /// binary at encode time and addressed PC-relative through its label.
+#[derive(Clone)]
 pub struct ConstantPool {
     pub label: Label,
     pub data: Vec<u8>,
     pub instrumented_blocks: Vec<(Label, usize)>,
 }
 
+#[derive(Clone)]
 pub struct Shader<'a> {
     pub model: &'a dyn Model,
     pub ssa_alloc: SSAValueAllocator,

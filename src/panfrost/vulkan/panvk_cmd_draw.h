@@ -56,11 +56,14 @@ struct panvk_resolve_attachment {
 
 struct panvk_rendering_state {
    VkRenderingFlags flags;
+   bool vt_frag_shared_sb;
    uint32_t layer_count;
    uint32_t view_mask;
    enum u_tristate first_provoking_vertex;
 
    enum vk_rp_attachment_flags bound_attachments;
+   bool merged_subpasses;
+   bool merged_subpass_barrier;
    struct {
       struct panvk_image_view *iviews[MAX_RTS];
       /* If non-null, preload_iviews[i] overrides iviews[i] for preloads. */
@@ -132,7 +135,34 @@ struct panvk_rendering_state {
 
    struct {
       uint64_t fbds[3];
+      void *fbds_cpu[3];
    } ir;
+#endif
+
+#if PAN_ARCH >= 14
+   struct {
+      uint64_t planes;
+      uint32_t layers;
+      uint8_t granule;
+      bool present;
+   } fsr;
+#endif
+
+#if PAN_ARCH >= 13
+   struct panvk_hsr_pass_stats {
+      uint64_t vertex_sum;
+      uint32_t draw_count;
+      uint32_t heavy_varying_draws;
+      bool has_indirect;
+      bool has_occluder;
+      bool has_cullable;
+      bool incomplete;
+      bool draw_can_cull;
+      bool draw_can_be_culled;
+      bool draw_varying_in_prepass;
+      uint32_t fbd_count;
+      uint32_t fbd_stride;
+   } hsr;
 #endif
 
 #if PAN_ARCH >= 15
@@ -149,6 +179,7 @@ enum panvk_cmd_graphics_dirty_state {
    PANVK_CMD_GRAPHICS_DIRTY_VS,
    PANVK_CMD_GRAPHICS_DIRTY_TCS,
    PANVK_CMD_GRAPHICS_DIRTY_TES,
+   PANVK_CMD_GRAPHICS_DIRTY_GS,
    PANVK_CMD_GRAPHICS_DIRTY_FS,
    PANVK_CMD_GRAPHICS_DIRTY_VB,
    PANVK_CMD_GRAPHICS_DIRTY_OQ,
@@ -173,6 +204,7 @@ struct panvk_cmd_graphics_state {
    struct panvk_occlusion_query_state occlusion_query;
 #if PAN_ARCH >= 10
    struct panvk_prims_generated_query_state prims_generated_query;
+   struct panvk_prims_generated_query_state xfb_query;
 #endif
    struct panvk_graphics_sysvals sysvals;
 
@@ -208,8 +240,16 @@ struct panvk_cmd_graphics_state {
       bool restart;
    } idvs;
 
+#if PAN_ARCH >= 12
+   struct {
+      uint64_t transforms;
+      bool array_mode;
+   } vp;
+#endif
+
    struct {
       const struct panvk_shader *shader;
+      const struct panvk_shader *bound;
       struct panvk_shader_desc_state desc;
       uint64_t push_uniforms;
 #if PAN_ARCH < 9
@@ -236,6 +276,7 @@ struct panvk_cmd_graphics_state {
 
       struct {
          const struct panvk_shader *shader;
+         const struct panvk_shader *bound;
          struct panvk_shader_desc_state desc;
          uint64_t push_uniforms;
       } tes;
@@ -243,6 +284,18 @@ struct panvk_cmd_graphics_state {
       /* VkDrawIndexedIndirectCommand emitted by the tessellator. */
       uint64_t out_draws;
    } tess;
+
+   struct {
+      const struct panvk_shader *bound;
+      const struct panvk_shader *shader;
+      struct panvk_shader_desc_state desc;
+      struct panvk_shader_desc_state count_desc;
+      uint64_t rast_push_uniforms;
+      uint64_t params;
+      uint64_t count_buffer;
+      uint64_t output_index_buffer;
+      uint32_t output_index_count;
+   } gs;
 
    struct {
       struct panvk_attrib_buf bufs[MAX_VBS];
@@ -277,6 +330,7 @@ struct panvk_cmd_graphics_state {
 
 #if PAN_ARCH >= 10
    uint64_t tsd;
+   bool cs_vertex_synced;
 #endif
 
    BITSET_DECLARE(dirty, PANVK_CMD_GRAPHICS_DIRTY_STATE_COUNT);
@@ -318,9 +372,8 @@ struct panvk_device_draw_context {
 #endif
 
 static inline void
-panvk_depth_range(const struct panvk_cmd_graphics_state *state,
-                  const struct vk_viewport_state *vp,
-                  float *z_min, float *z_max)
+panvk_viewport_depth_range(const struct vk_viewport_state *vp, float scale_z,
+                           float offset_z, float *z_min, float *z_max)
 {
    if (vp->depth_clamp_mode == VK_DEPTH_CLAMP_MODE_USER_DEFINED_RANGE_EXT) {
       *z_min = vp->depth_clamp_range.minDepthClamp;
@@ -328,12 +381,86 @@ panvk_depth_range(const struct panvk_cmd_graphics_state *state,
       return;
    }
 
-   float a = vp->depth_clip_negative_one_to_one ?
-      state->sysvals.viewport.offset.z - state->sysvals.viewport.scale.z :
-      state->sysvals.viewport.offset.z;
-   float b = state->sysvals.viewport.offset.z + state->sysvals.viewport.scale.z;
+   float a = vp->depth_clip_negative_one_to_one ? offset_z - scale_z
+                                                : offset_z;
+   float b = offset_z + scale_z;
    *z_min = MIN2(a, b);
    *z_max = MAX2(a, b);
+}
+
+static inline void
+panvk_depth_range(const struct panvk_cmd_graphics_state *state,
+                  const struct vk_viewport_state *vp,
+                  float *z_min, float *z_max)
+{
+   panvk_viewport_depth_range(vp, state->sysvals.viewport.scale.z,
+                              state->sysvals.viewport.offset.z, z_min, z_max);
+}
+
+/* This value has been selected to get
+ * dEQP-VK.draw.renderpass.inverted_depth_ranges.nodepthclamp_deltazero passing.
+ */
+#define MIN_DEPTH_CLIP_RANGE 37.7E-06f
+
+static inline void
+panvk_viewport_transform(const struct vk_rasterization_state *rs,
+                         const struct vk_viewport_state *vp,
+                         const VkViewport *viewport, float *scale,
+                         float *offset)
+{
+   /* Doing the viewport transform in the vertex shader and then depth
+    * clipping with the viewport depth range gets a similar result to
+    * clipping in clip-space, but loses precision when the viewport depth
+    * range is very small. When minDepth == maxDepth, this completely
+    * flattens the clip-space depth and results in never clipping.
+    *
+    * To work around this, set a lower limit on depth range when clipping is
+    * enabled. This results in slightly incorrect fragment depth values, and
+    * doesn't help with the precision loss, but at least clipping isn't
+    * completely broken.
+    */
+   float z_min = viewport->minDepth;
+   float z_max = viewport->maxDepth;
+   if (vk_rasterization_state_depth_clip_enable(rs) &&
+       fabsf(z_max - z_min) < MIN_DEPTH_CLIP_RANGE) {
+      float z_sign = z_min <= z_max ? 1.0f : -1.0f;
+
+      float z_center = 0.5f * (z_max + z_min);
+      /* Bump offset off-center if necessary, to not go out of range */
+      z_center = CLAMP(z_center, 0.5f * MIN_DEPTH_CLIP_RANGE,
+                       1.0f - 0.5f * MIN_DEPTH_CLIP_RANGE);
+
+      z_min = z_center - 0.5f * z_sign * MIN_DEPTH_CLIP_RANGE;
+      z_max = z_center + 0.5f * z_sign * MIN_DEPTH_CLIP_RANGE;
+   }
+
+   /* Upload the viewport scale. Defined as (px/2, py/2, pz) at the start of
+    * section 24.5 ("Controlling the Viewport") of the Vulkan spec. At the
+    * end of the section, the spec defines:
+    *
+    * px = width
+    * py = height
+    * pz = maxDepth - minDepth         if negativeOneToOne is false
+    * pz = (maxDepth - minDepth) / 2   if negativeOneToOne is true
+    */
+   scale[0] = 0.5f * viewport->width;
+   scale[1] = 0.5f * viewport->height;
+   scale[2] = vp->depth_clip_negative_one_to_one ? 0.5f * (z_max - z_min)
+                                                 : z_max - z_min;
+
+   /* Upload the viewport offset. Defined as (ox, oy, oz) at the start of
+    * section 24.5 ("Controlling the Viewport") of the Vulkan spec. At the
+    * end of the section, the spec defines:
+    *
+    * ox = x + width/2
+    * oy = y + height/2
+    * oz = minDepth                    if negativeOneToOne is false
+    * oz = (maxDepth + minDepth) / 2   if negativeOneToOne is true
+    */
+   offset[0] = (0.5f * viewport->width) + viewport->x;
+   offset[1] = (0.5f * viewport->height) + viewport->y;
+   offset[2] = vp->depth_clip_negative_one_to_one ? 0.5f * (z_min + z_max)
+                                                  : z_min;
 }
 
 static inline uint32_t
@@ -463,6 +590,8 @@ panvk_per_arch(cmd_init_render_state)(struct panvk_cmd_buffer *cmdbuf,
                                       const VkRenderingInfo *pRenderingInfo);
 
 void panvk_per_arch(cmd_select_tile_size)(struct panvk_cmd_buffer *cmdbuf);
+
+void panvk_per_arch(cmd_update_polygon_mode)(struct panvk_cmd_buffer *cmd);
 
 struct panvk_draw_info {
    struct {

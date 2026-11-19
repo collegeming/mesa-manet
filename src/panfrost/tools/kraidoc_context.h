@@ -10,6 +10,8 @@
 #include "vk_physical_device.h"
 #include "genxml/gen_macros.h"
 #include "panvk_macros.h"
+#include "util/u_call_once.h"
+#include "util/u_queue.h"
 
 VkResult panvk_per_arch(CreateDescriptorSetLayout)(
    VkDevice, const VkDescriptorSetLayoutCreateInfo *,
@@ -37,6 +39,12 @@ struct panvk_physical_device {
 
 struct panvk_device {
    struct vk_device vk;
+   struct {
+      util_once_flag once;
+      struct util_queue queue;
+      bool ready;
+      uint32_t pending;
+   } bg_compile;
 };
 
 VK_DEFINE_HANDLE_CASTS(panvk_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)

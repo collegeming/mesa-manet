@@ -61,6 +61,7 @@ struct panvk_cmd_compute_state {
 enum panvk_csf_barrier {
    PANVK_CSF_BARRIER_SYNC,
    PANVK_CSF_BARRIER_WAIT,
+   PANVK_CSF_BARRIER_NONE,
 };
 
 void panvk_per_arch(cmd_signal_barrier)(
@@ -83,9 +84,16 @@ struct panvk_dispatch_info {
    } indirect;
 
    uint32_t wg_size_x;
+   uint32_t tls_size;
 
 #if PAN_ARCH >= 10
    enum panvk_csf_barrier barrier;
+   bool pilot_queued;
+#endif
+
+#if PAN_ARCH >= 15
+   bool infer_task_axis;
+   uint64_t rt_launch_size;
 #endif
 };
 

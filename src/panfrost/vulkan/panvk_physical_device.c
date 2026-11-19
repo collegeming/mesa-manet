@@ -32,6 +32,7 @@
 #include "util/u_atomic.h"
 #include "git_sha1.h"
 
+#include "vk_acceleration_structure.h"
 #include "vk_android.h"
 #include "vk_device.h"
 #include "vk_drm_syncobj.h"
@@ -42,12 +43,15 @@
 #include "vk_util.h"
 #include "vk_sync.h"
 
+#include "panvk_bc_emu.h"
 #include "panvk_device.h"
 #include "panvk_entrypoints.h"
 #include "panvk_image.h"
 #include "panvk_instance.h"
 #include "panvk_perf_counters_by_region.h"
 #include "panvk_physical_device.h"
+
+alignas(8) uint64_t panvk_heap_used;
 #include "panvk_tensor.h"
 #include "panvk_wsi.h"
 
@@ -459,6 +463,9 @@ init_shader_caches(struct panvk_physical_device *device,
    const uint64_t driver_flags =
       pan_get_compiler_flags(pan_arch(device->kmod.dev->props.gpu_id));
    _mesa_blake3_update(&blake3_ctx, &driver_flags, sizeof(driver_flags));
+
+   uint32_t shader_info_size = sizeof(struct pan_shader_info);
+   _mesa_blake3_update(&blake3_ctx, &shader_info_size, sizeof(shader_info_size));
 
    unsigned char blake3[BLAKE3_KEY_LEN];
    _mesa_blake3_final(&blake3_ctx, blake3);
@@ -1467,6 +1474,28 @@ fail:
 }
 
 #if defined(HAVE_PAN_KMOD_KBASE)
+static void
+get_kbase_drm_device_ids(struct panvk_physical_device *device)
+{
+   struct stat fd_st, node_st;
+   drmDevicePtr drm_device;
+
+   if (fstat(device->kmod.dev->fd, &fd_st) || !S_ISCHR(fd_st.st_mode))
+      return;
+
+   if (drmGetDevice2(device->kmod.dev->fd, 0, &drm_device))
+      return;
+
+   if ((drm_device->available_nodes & (1 << DRM_NODE_RENDER)) &&
+       !stat(drm_device->nodes[DRM_NODE_RENDER], &node_st) &&
+       node_st.st_rdev == fd_st.st_rdev) {
+      device->drm.render_rdev = fd_st.st_rdev;
+      device->drm.primary_rdev = fd_st.st_rdev;
+   }
+
+   drmFreeDevice(&drm_device);
+}
+
 VkResult
 panvk_physical_device_init_kbase(struct panvk_physical_device *device,
                                  struct panvk_instance *instance,
@@ -1489,7 +1518,6 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
    case 6:
    case 7:
    case 14:
-   case 15:
       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
                                "WARNING: panvk is not well-tested on v%d, "
@@ -1503,6 +1531,7 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
    case 11:
    case 12:
    case 13:
+   case 15:
       break;
 
    default:
@@ -1511,8 +1540,7 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
       goto fail_kbase;
    }
 
-   /* kbase does not expose DRM nodes, so drm.{render,primary}_rdev are left
-    * zeroed; WSI paths that compare rdev values will simply not match. */
+   get_kbase_drm_device_ids(device);
 
    device->formats.all = pan_format_table(arch);
    device->formats.blendable = pan_blendable_format_table(arch);
@@ -1659,6 +1687,7 @@ panvk_GetPhysicalDeviceQueueFamilyProperties2(
       [PANVK_QUEUE_FAMILY_GPU] = {
          .queueFlags =
             VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
+            (physical_device->vk.supported_features.dataGraph ? VK_QUEUE_DATA_GRAPH_BIT_ARM : 0) |
             (physical_device->vk.supported_features.sparseBinding
                 ? VK_QUEUE_SPARSE_BINDING_BIT
                 : 0),
@@ -1692,6 +1721,39 @@ panvk_GetPhysicalDeviceQueueFamilyProperties2(
             panvk_fill_global_priority(physical_device, family, prio);
       }
    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+panvk_GetPhysicalDeviceQueueFamilyDataGraphPropertiesARM(
+   VkPhysicalDevice device, uint32_t family, uint32_t *count,
+   VkQueueFamilyDataGraphPropertiesARM *properties)
+{
+   VK_FROM_HANDLE(panvk_physical_device, pdev, device);
+   VK_OUTARRAY_MAKE_TYPED(VkQueueFamilyDataGraphPropertiesARM, out, properties, count);
+   if (family == PANVK_QUEUE_FAMILY_GPU && pdev->vk.supported_features.dataGraph) {
+      vk_outarray_append_typed(VkQueueFamilyDataGraphPropertiesARM, &out, p) {
+         p->engine = (VkPhysicalDeviceDataGraphProcessingEngineARM){
+            .type = VK_PHYSICAL_DEVICE_DATA_GRAPH_PROCESSING_ENGINE_TYPE_DEFAULT_ARM,
+            .isForeign = false,
+         };
+         p->operation = (VkPhysicalDeviceDataGraphOperationSupportARM){
+            .operationType = VK_PHYSICAL_DEVICE_DATA_GRAPH_OPERATION_TYPE_SPIRV_EXTENDED_INSTRUCTION_SET_ARM,
+            .name = "TOSA.001000.1",
+            .version = 0,
+         };
+      }
+   }
+   return vk_outarray_status(&out);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+panvk_GetPhysicalDeviceQueueFamilyDataGraphProcessingEnginePropertiesARM(
+   VkPhysicalDevice device,
+   const VkPhysicalDeviceQueueFamilyDataGraphProcessingEngineInfoARM *info,
+   VkQueueFamilyDataGraphProcessingEnginePropertiesARM *properties)
+{
+   properties->foreignMemoryHandleTypes = 0;
+   properties->foreignSemaphoreHandleTypes = 0;
 }
 
 struct panvk_cmat_config {
@@ -1805,6 +1867,52 @@ panvk_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
    return vk_outarray_status(&out);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL
+panvk_GetPhysicalDeviceFragmentShadingRatesKHR(
+   VkPhysicalDevice physicalDevice, uint32_t *pFragmentShadingRateCount,
+   VkPhysicalDeviceFragmentShadingRateKHR *pFragmentShadingRates)
+{
+   VK_OUTARRAY_MAKE_TYPED(VkPhysicalDeviceFragmentShadingRateKHR, out,
+                          pFragmentShadingRates, pFragmentShadingRateCount);
+
+   static const struct {
+      uint32_t width, height;
+      VkSampleCountFlags samples;
+   } rates[] = {
+      {4, 4, VK_SAMPLE_COUNT_1_BIT},
+      {4, 2, VK_SAMPLE_COUNT_1_BIT},
+      {2, 4, VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT},
+      {2, 2, VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                VK_SAMPLE_COUNT_4_BIT},
+      {2, 1, VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                VK_SAMPLE_COUNT_4_BIT},
+      {1, 2, VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT |
+                VK_SAMPLE_COUNT_4_BIT},
+      {1, 1, ~0u},
+   };
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(rates); i++) {
+      vk_outarray_append_typed(VkPhysicalDeviceFragmentShadingRateKHR, &out,
+                               r) {
+         *r = (VkPhysicalDeviceFragmentShadingRateKHR){
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR,
+            .sampleCounts = rates[i].samples,
+            .fragmentSize = {rates[i].width, rates[i].height},
+         };
+      }
+   }
+
+   return vk_outarray_status(&out);
+}
+
+static bool
+panvk_format_is_fsr_attachment(const struct panvk_physical_device *physical_device,
+                               VkFormat format)
+{
+   return pan_arch(physical_device->kmod.dev->props.gpu_id) >= 14 &&
+          format == VK_FORMAT_R8_UINT;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_GetPhysicalDeviceMemoryProperties2(
    VkPhysicalDevice physicalDevice,
@@ -1831,7 +1939,7 @@ panvk_GetPhysicalDeviceMemoryProperties2(
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
          VkPhysicalDeviceMemoryBudgetPropertiesEXT *p = ext;
 
-         uint64_t used = p_atomic_read(&physical_device->memory.heap_used);
+         uint64_t used = p_atomic_read(&panvk_heap_used);
          uint64_t heap_size = physical_device->memory.heaps[0].size;
 
          /* From the Vulkan 1.3.278 spec:
@@ -1931,7 +2039,8 @@ format_is_supported(struct panvk_physical_device *physical_device,
       uint32_t supported_compr_fmts =
          pan_query_compressed_formats(&physical_device->kmod.dev->props);
 
-      if (!(BITFIELD_BIT(fmt.texfeat_bit) & supported_compr_fmts))
+      if (!(BITFIELD_BIT(fmt.texfeat_bit) & supported_compr_fmts) &&
+          !panvk_bc_emulated(physical_device, vk_format_from_pipe_format(pfmt)))
          return false;
    }
 
@@ -1996,6 +2105,9 @@ get_image_plane_format_features(struct panvk_physical_device *physical_device,
 
    if (fmt.bind & PAN_BIND_DEPTH_STENCIL)
       features |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT;
+
+   if (panvk_bc_emulated(physical_device, format))
+      return features;
 
    if (features != 0)
       features |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT;
@@ -2157,8 +2269,12 @@ get_buffer_format_features(struct panvk_physical_device *physical_device,
    enum pipe_format pfmt = vk_format_to_pipe_format(format);
    const struct pan_format fmt = physical_device->formats.all[pfmt];
 
+   if (physical_device->vk.supported_extensions.KHR_acceleration_structure &&
+       vk_acceleration_struct_vtx_format_supported(format))
+      features |= VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR;
+
    if (!format_is_supported(physical_device, fmt, pfmt))
-      return 0;
+      return features;
 
    /* Reject sRGB formats (see
     * https://github.com/KhronosGroup/Vulkan-Docs/issues/2214).
@@ -2205,21 +2321,30 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    VkFormatFeatureFlags2 buffer =
       get_buffer_format_features(physical_device, format);
 
-   VkFormatFeatureFlags tex_legacy = vk_format_features2_to_features(tex);
+   VkFormatFeatureFlags2 tex_optimal = tex;
+   if (tex && panvk_format_is_fsr_attachment(physical_device, format))
+      tex_optimal |= VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+
+   const bool bc_emu = panvk_bc_emulated(physical_device, format);
+   VkFormatFeatureFlags2 tex_linear = bc_emu ? 0 : tex;
+
+   VkFormatFeatureFlags tex_legacy = vk_format_features2_to_features(tex_linear);
+   VkFormatFeatureFlags tex_optimal_legacy =
+      vk_format_features2_to_features(tex_optimal);
    VkFormatFeatureFlags buffer_legacy =
       vk_format_features2_to_features(buffer);
 
    pFormatProperties->formatProperties = (VkFormatProperties){
       .linearTilingFeatures = tex_legacy,
-      .optimalTilingFeatures = tex_legacy,
+      .optimalTilingFeatures = tex_optimal_legacy,
       .bufferFeatures = buffer_legacy,
    };
 
    VkFormatProperties3 *formatProperties3 =
       vk_find_struct(pFormatProperties->pNext, FORMAT_PROPERTIES_3);
    if (formatProperties3) {
-      formatProperties3->linearTilingFeatures = tex;
-      formatProperties3->optimalTilingFeatures = tex;
+      formatProperties3->linearTilingFeatures = tex_linear;
+      formatProperties3->optimalTilingFeatures = tex_optimal;
       formatProperties3->bufferFeatures = buffer;
    }
 
@@ -2234,7 +2359,7 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
                               list->pDrmFormatModifierProperties,
                               &list->drmFormatModifierCount);
 
-      if (tex) {
+      if (tex && !bc_emu) {
          for (uint32_t mi = 0; mi < ARRAY_SIZE(supported); mi++) {
             uint64_t mod = supported[mi];
             uint32_t caps =
@@ -2268,7 +2393,7 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
                               list2->pDrmFormatModifierProperties,
                               &list2->drmFormatModifierCount);
 
-      if (tex) {
+      if (tex && !bc_emu) {
          for (uint32_t mi = 0; mi < ARRAY_SIZE(supported); mi++) {
             uint64_t mod = supported[mi];
             uint32_t caps =
@@ -2363,6 +2488,13 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(info->format);
 
+   if (panvk_bc_emulated(physical_device, info->format) &&
+       (info->type == VK_IMAGE_TYPE_1D || info->tiling != VK_IMAGE_TILING_OPTIMAL ||
+        (info->flags & (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+                        VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT |
+                        VK_IMAGE_CREATE_SPARSE_ALIASED_BIT))))
+      goto unsupported;
+
    if (info->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
       if (!physical_device->vk.supported_features.sparseBinding)
          goto unsupported;
@@ -2435,6 +2567,11 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
 
    if (format_feature_flags == 0)
       goto unsupported;
+
+   if (info->tiling == VK_IMAGE_TILING_OPTIMAL && ycbcr_info == NULL &&
+       panvk_format_is_fsr_attachment(physical_device, info->format))
+      format_feature_flags |=
+         VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
 
    switch (info->tiling) {
    case VK_IMAGE_TILING_LINEAR:
@@ -2585,7 +2722,16 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
           !(format_feature_flags &
             VK_FORMAT_FEATURE_2_TENSOR_IMAGE_ALIASING_BIT_ARM))
          goto unsupported;
+
+      if ((all_usage &
+           VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR) &&
+          !(format_feature_flags &
+            VK_FORMAT_FEATURE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR))
+         goto unsupported;
    }
+
+   if (all_usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
+      sampleCounts = VK_SAMPLE_COUNT_1_BIT;
 
    *pImageFormatProperties = (VkImageFormatProperties){
       .maxExtent = maxExtent,

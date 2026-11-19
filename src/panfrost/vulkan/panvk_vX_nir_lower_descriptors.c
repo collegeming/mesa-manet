@@ -17,6 +17,7 @@
 #endif
 #include "panvk_sampler.h"
 #include "panvk_shader.h"
+#include "panvk_nir_rt_pipeline.h"
 
 #include "vk_format.h"
 #include "vk_graphics_state.h"
@@ -221,7 +222,10 @@ shader_desc_idx(uint32_t set, uint32_t binding,
 #else
    /* Dynamic buffers are pushed directly in the resource tables, after all
     * sets. */
-   idx = pan_res_handle(0, ctx->desc_info.dyn_bufs_start + idx);
+   if (PAN_ARCH >= 15)
+      idx = pan_res_handle(PANVK_DYN_BUF_TABLE, idx);
+   else
+      idx = pan_res_handle(0, ctx->desc_info.dyn_bufs_start + idx);
 #endif
 
    return idx;
@@ -1462,20 +1466,23 @@ upload_shader_desc_info(struct panvk_device *dev,
    assert(lower_info->dyn_ubos.count <=
           ARRAY_SIZE(desc_info->dyn_ubos.map));
    desc_info->dyn_ubos.count = lower_info->dyn_ubos.count;
-   memcpy(desc_info->dyn_ubos.map, lower_info->dyn_ubos.map,
-          lower_info->dyn_ubos.count * sizeof(*desc_info->dyn_ubos.map));
+   if (lower_info->dyn_ubos.count != 0)
+      memcpy(desc_info->dyn_ubos.map, lower_info->dyn_ubos.map,
+             lower_info->dyn_ubos.count * sizeof(*desc_info->dyn_ubos.map));
    assert(lower_info->dyn_ssbos.count <=
           ARRAY_SIZE(desc_info->dyn_ssbos.map));
    desc_info->dyn_ssbos.count = lower_info->dyn_ssbos.count;
-   memcpy(
-      desc_info->dyn_ssbos.map, lower_info->dyn_ssbos.map,
-      lower_info->dyn_ssbos.count * sizeof(*desc_info->dyn_ssbos.map));
+   if (lower_info->dyn_ssbos.count != 0)
+      memcpy(
+         desc_info->dyn_ssbos.map, lower_info->dyn_ssbos.map,
+         lower_info->dyn_ssbos.count * sizeof(*desc_info->dyn_ssbos.map));
 #else
    assert(lower_info->dyn_bufs.count <=
           ARRAY_SIZE(desc_info->dyn_bufs.map));
    desc_info->dyn_bufs.count = lower_info->dyn_bufs.count;
-   memcpy(desc_info->dyn_bufs.map, lower_info->dyn_bufs.map,
-          lower_info->dyn_bufs.count * sizeof(*desc_info->dyn_bufs.map));
+   if (lower_info->dyn_bufs.count != 0)
+      memcpy(desc_info->dyn_bufs.map, lower_info->dyn_bufs.map,
+             lower_info->dyn_bufs.count * sizeof(*desc_info->dyn_bufs.map));
 #endif
 
    desc_info->used_set_mask = lower_info->used_set_mask;
@@ -1517,6 +1524,21 @@ panvk_per_arch(nir_lower_descriptors)(
 
    for (uint32_t i = 0; i < set_layout_count; i++)
       ctx.set_layouts[i] = to_panvk_descriptor_set_layout(set_layouts[i]);
+
+   if (PAN_ARCH >= 15 && panvk_nir_is_native_rt(nir)) {
+      for (uint32_t set = 0; set < set_layout_count; set++) {
+         const struct panvk_descriptor_set_layout *layout = ctx.set_layouts[set];
+         if (!layout)
+            continue;
+         for (uint32_t binding = 0; binding < layout->binding_count; binding++) {
+            if (!layout->bindings[binding].desc_count ||
+                !vk_descriptor_type_is_dynamic(layout->bindings[binding].type))
+               continue;
+            record_binding(&ctx, set, binding, NO_SUBDESC, UINT32_MAX);
+            progress = true;
+         }
+      }
+   }
 
    NIR_PASS(progress, nir, nir_shader_instructions_pass,
             collect_instr_desc_access, nir_metadata_all, &ctx);

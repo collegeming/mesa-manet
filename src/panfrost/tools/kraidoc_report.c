@@ -62,6 +62,24 @@ producer(FILE *f, const char *schema)
    fprintf(f, "},\"schema\":{\"name\":\"%s\",\"version\":0}", schema);
 }
 
+static const char *
+arch_name(unsigned arch)
+{
+   return arch >= 12 ? "5th Gen" : "Valhall";
+}
+
+static unsigned
+rev_major(uint64_t gpu_id)
+{
+   return pan_rev(gpu_id) >> 8;
+}
+
+static unsigned
+rev_minor(uint64_t gpu_id)
+{
+   return pan_rev(gpu_id) & 0xff;
+}
+
 bool
 kraidoc_write_list(FILE *f, bool json)
 {
@@ -71,7 +89,7 @@ kraidoc_write_list(FILE *f, bool json)
    for (unsigned i = 0; i < pan_model_count; i++) {
       const struct pan_model *model = &pan_model_list[i];
       unsigned arch = model->gpu_prod_id >> 16;
-      if (arch < 9 || arch > 11)
+      if (!kraidoc_arch_supported(arch))
          continue;
       bool duplicate = false;
       for (unsigned j = 0; j < i; j++)
@@ -83,8 +101,8 @@ kraidoc_write_list(FILE *f, bool json)
          string(f, model->name);
          fputc('}', f);
       } else {
-         fprintf(f, "%s variant %u (Valhall %u): Vulkan SPIR-V\n", model->name,
-                 model->gpu_variant, arch);
+         fprintf(f, "%s variant %u (%s %u): Vulkan SPIR-V\n", model->name,
+                 model->gpu_variant, arch_name(arch), arch);
       }
       comma = true;
    }
@@ -101,7 +119,8 @@ kraidoc_write_info(FILE *f, bool json, uint64_t gpu_id, uint32_t gpu_variant)
 {
    const struct pan_model *model = pan_get_model(gpu_id, gpu_variant);
    if (json) {
-      fputs("{\"hardware\":{\"architecture\":\"Valhall\",\"core\":", f);
+      fprintf(f, "{\"hardware\":{\"architecture\":\"%s\",\"core\":",
+              arch_name(pan_arch(gpu_id)));
       string(f, model->name);
       fprintf(
          f,
@@ -109,16 +128,16 @@ kraidoc_write_info(FILE *f, bool json, uint64_t gpu_id, uint32_t gpu_variant)
          "\"apis\":{\"vulkan\":{\"max_version\":1.6},"
          "\"opengles\":{\"max_version\":null},\"opencl\":{\"max_version\":null}},"
          "\"kraid\":{\"input\":\"SPIR-V\",\"stages\":[\"vertex\",\"fragment\",\"compute\"]},",
-         (unsigned)PAN_VERSION_MAJOR(gpu_id), (unsigned)PAN_VERSION_MINOR(gpu_id), PACKAGE_VERSION);
+         rev_major(gpu_id), rev_minor(gpu_id), PACKAGE_VERSION);
       producer(f, "info");
       fputs("}\n", f);
    } else {
       fprintf(f,
-              "Hardware: %s r%up%u\nArchitecture: Valhall\nDriver: Mesa %s\n"
+              "Hardware: %s r%up%u\nArchitecture: %s\nDriver: Mesa %s\n"
               "API: Vulkan\nInput: SPIR-V 1.0 through 1.6\n"
               "Stages: vertex, fragment, compute\n",
-              model->name, (unsigned)PAN_VERSION_MAJOR(gpu_id), (unsigned)PAN_VERSION_MINOR(gpu_id),
-              PACKAGE_VERSION);
+              model->name, rev_major(gpu_id), rev_minor(gpu_id),
+              arch_name(pan_arch(gpu_id)), PACKAGE_VERSION);
    }
    return !ferror(f);
 }
@@ -158,7 +177,7 @@ cycles(FILE *f, const struct valhall_stats *s, bool compute)
 
 static void
 program(FILE *f, bool json, bool detailed, const char *name, unsigned index,
-        const struct panvk_shader_variant *variant,
+        const struct pan_shader_info *info,
         const struct pan_stats *stats, bool pilot, bool comma)
 {
    const struct valhall_stats *s = &stats->valhall;
@@ -172,13 +191,13 @@ program(FILE *f, bool json, bool detailed, const char *name, unsigned index,
               "Uniform registers: %u\nShared storage size: %u bytes\n"
               "Stack size: %u bytes\nStack spilling: %s\n",
               s->registers_used, occupancy, s->uniforms_used * 2,
-              variant->info.wls_size, stack,
+              info->wls_size, stack,
               s->stack_spill_bytes ? "true" : "false");
       fprintf(f, "Code size: %u bytes\nLoops: %u\nSpills/fills: %u/%u\n",
               s->code_size, s->loops, s->spills, s->fills);
       const char *labels[] = {"A", "FMA", "CVT", "SFU", "LS", "V", "T"};
       float values[] = {s->alu, s->fma, s->cvt, s->sfu, s->ls, s->v, s->t};
-      bool compute = variant->info.stage == MESA_SHADER_COMPUTE;
+      bool compute = info->stage == MESA_SHADER_COMPUTE;
       fprintf(f, "\n%-25s", "");
       for (unsigned i = 0; i < ARRAY_SIZE(values); i++)
          if (!((!detailed && i >= 1 && i <= 3) || (compute && i == 5)))
@@ -212,7 +231,7 @@ program(FILE *f, bool json, bool detailed, const char *name, unsigned index,
    property(f, "uniform_registers_used", "Uniform Registers Used",
             s->uniforms_used * 2, true);
    property(f, "shared_storage_size", "Shared Storage Size",
-            variant->info.wls_size, true);
+            info->wls_size, true);
    property(f, "stack_size", "Stack Size", stack, true);
    boolean(f, "has_stack_spilling", s->stack_spill_bytes != 0);
    property(f, "stack_spill_bytes", "Stack Spill Size (bytes)",
@@ -228,14 +247,14 @@ program(FILE *f, bool json, bool detailed, const char *name, unsigned index,
    property(f, "fills", "Fills", s->fills, true);
    property(f, "maximum_threads", "Maximum Threads", s->threads, true);
    fputs("],\"performance\":", f);
-   cycles(f, s, variant->info.stage == MESA_SHADER_COMPUTE);
+   cycles(f, s, info->stage == MESA_SHADER_COMPUTE);
    fputc('}', f);
 }
 
 bool
 kraidoc_write_report(FILE *f, bool json, bool detailed,
                      const struct kraidoc_report_context *ctx,
-                     const struct panvk_shader *shader)
+                     const struct kraidoc_variant *variants, unsigned count)
 {
    const struct pan_model *model = pan_get_model(ctx->gpu_id, ctx->gpu_variant);
    const char *stage = ctx->stage == MESA_SHADER_VERTEX     ? "Vertex"
@@ -256,10 +275,11 @@ kraidoc_write_report(FILE *f, bool json, bool detailed,
       string(f, ctx->filename);
       fputs(",\"driver\":", f);
       string(f, "Mesa " PACKAGE_VERSION);
-      fputs(",\"hardware\":{\"architecture\":\"Valhall\",\"core\":", f);
+      fprintf(f, ",\"hardware\":{\"architecture\":\"%s\",\"core\":",
+              arch_name(pan_arch(ctx->gpu_id)));
       string(f, model->name);
       fprintf(f, ",\"revision\":\"r%up%u\",\"pipelines\":[",
-              (unsigned)PAN_VERSION_MAJOR(ctx->gpu_id), (unsigned)PAN_VERSION_MINOR(ctx->gpu_id));
+              rev_major(ctx->gpu_id), rev_minor(ctx->gpu_id));
       for (unsigned i = 0; i < ARRAY_SIZE(pipelines); i++)
          fprintf(
             f,
@@ -277,27 +297,26 @@ kraidoc_write_report(FILE *f, bool json, bool detailed,
    } else {
       fprintf(f,
               "kraidoc %s\n\nConfiguration\n=============\n\n"
-              "Hardware: %s r%up%u\nArchitecture: Valhall\n"
+              "Hardware: %s r%up%u\nArchitecture: %s\n"
               "Driver: Mesa %s\nShader type: Vulkan %s\n",
-              PACKAGE_VERSION, model->name, (unsigned)PAN_VERSION_MAJOR(ctx->gpu_id),
-              (unsigned)PAN_VERSION_MINOR(ctx->gpu_id), PACKAGE_VERSION, stage);
+              PACKAGE_VERSION, model->name, rev_major(ctx->gpu_id),
+              rev_minor(ctx->gpu_id), arch_name(pan_arch(ctx->gpu_id)),
+              PACKAGE_VERSION, stage);
    }
    bool comma = false;
-   panvk_shader_foreach_variant_const(shader, variant)
-   {
-      if (!variant->bin_size)
-         continue;
-      unsigned index = variant - shader->variants;
-      bool idvs = ctx->stage == MESA_SHADER_VERTEX && variant->info.vs.idvs;
-      program(f, json, detailed, idvs ? "Position" : "Main", index, variant,
-              &variant->info.stats, false, comma);
+   for (unsigned i = 0; i < count; i++) {
+      const struct kraidoc_variant *variant = &variants[i];
+      const struct pan_shader_info *info = variant->main.info;
+      bool idvs = ctx->stage == MESA_SHADER_VERTEX && info->vs.idvs;
+      program(f, json, detailed, idvs ? "Position" : "Main", variant->index,
+              info, &info->stats, false, comma);
       comma = true;
-      if (idvs && variant->info.vs.secondary_offset)
-         program(f, json, detailed, "Varying", index, variant,
-                 &variant->info.stats_idvs_varying, false, true);
-      if (variant->preamble)
-         program(f, json, detailed, "Pilot", index, variant->preamble,
-                 &variant->preamble->info.stats, true, true);
+      if (idvs && info->vs.secondary_offset)
+         program(f, json, detailed, "Varying", variant->index, info,
+                 &info->stats_idvs_varying, false, true);
+      if (variant->pilot.info)
+         program(f, json, detailed, "Pilot", variant->index,
+                 variant->pilot.info, &variant->pilot.info->stats, true, true);
    }
    if (json)
       fputs("]}]}\n", f);

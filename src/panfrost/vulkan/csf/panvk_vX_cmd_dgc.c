@@ -153,7 +153,8 @@ emit_idvs_once(struct panvk_cmd_buffer *cmdbuf, enum mali_index_type index_type)
    cs_move32_to(b, cs_scratch_reg32(b, 9), 0);
 #if PAN_ARCH >= 12
    cs_trace_run_idvs2(b, trace, cs_scratch_reg_tuple(b, 10, 4), flags.opaque[0],
-                      true, cs_scratch_reg32(b, 9), MALI_IDVS_SHADING_MODE_EARLY);
+                      true, cs_scratch_reg32(b, 9), MALI_IDVS_SHADING_MODE_EARLY,
+                      MALI_IDVS_PIPELINE_STAGE_VERTEX);
 #else
    cs_trace_run_idvs(b, trace, cs_scratch_reg_tuple(b, 10, 4), flags.opaque[0],
                      true, cs_shader_res_sel(0, 0, 1, 0),
@@ -318,7 +319,7 @@ emit_dispatch_program(struct panvk_cmd_buffer *cmdbuf)
       cs_next_iter_sb(cmdbuf, PANVK_SUBQUEUE_COMPUTE,
                       cs_scratch_reg_tuple(b, 0, 2));
       cs_trace_run_compute(b, trace, cs_scratch_reg_tuple(b, 0, 4),
-                           1, MALI_TASK_AXIS_X, PANVK_COMPUTE_RES_SEL);
+                           1, MALI_TASK_AXIS_X, PANVK_COMPUTE_RES_SEL, true);
    }
 }
 

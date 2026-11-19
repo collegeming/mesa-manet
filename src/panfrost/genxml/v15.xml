@@ -63,6 +63,7 @@
     <value name="S64" value="14"/>
     <value name="F16" value="26"/>
     <value name="F32" value="28"/>
+    <value name="Rescale Coefficients" value="31"/>
   </enum>
 
   <enum name="Tensor Tiling">
@@ -483,6 +484,7 @@
     <value name="X" value="0"/>
     <value name="Y" value="1"/>
     <value name="Z" value="2"/>
+    <value name="Inferred" value="3"/>
   </enum>
 
   <enum name="Attribute Frequency">
@@ -565,6 +567,7 @@
     <value name="FINISH_TILING" value="9"/>
     <value name="FINISH_FRAGMENT" value="11"/>
     <value name="RUN_IDVS2" value="12"/>
+    <value name="RUN_NEURAL" value="13"/>
     <value name="RUN_FRAGMENT2" value="14"/>
     <value name="ARITH_IMM32" value="16"/>
     <value name="ARITH_IMM64" value="17"/>
@@ -744,6 +747,7 @@
     <value name="SB Sel Endpoint" value="0"/>
     <value name="SB Sel Other" value="1"/>
     <value name="SB Sel Deferred" value="2"/>
+    <value name="Dynamic Cache" value="6"/>
     <value name="SB Mask Stream" value="8"/>
     <value name="SB Mask Wait" value="9"/>
   </enum>
@@ -836,6 +840,13 @@
     <field name="Draw ID" size="8" start="40" type="uint"/>
     <field name="Stage" size="4" start="48" type="IDVS Pipeline Stage" default="Internal"/>
     <field name="Opcode" size="8" start="56" type="CS Opcode" default="RUN_IDVS2"/>
+  </struct>
+
+  <struct name="CS RUN_NEURAL" size="2">
+    <field name="ICNT" size="8" start="16" type="uint" default="16"/>
+    <field name="Staging Count" size="8" start="24" type="uint" default="36"/>
+    <field name="Base Register" size="8" start="48" type="uint" default="0"/>
+    <field name="Opcode" size="8" start="56" type="CS Opcode" default="RUN_NEURAL"/>
   </struct>
 
   <struct name="CS RUN_FRAGMENT2" size="2">
@@ -932,6 +943,7 @@
   <struct name="CS SET_STATE_IMM32" size="2">
     <field name="Value" size="32" start="0" type="uint"/>
     <field name="State" size="8" start="32" type="CS Set State Type"/>
+    <field name="Selection Mask" size="16" start="40" type="hex"/>
     <field name="Opcode" size="8" start="56" type="CS Opcode" default="SET_STATE_IMM32"/>
   </struct>
 
@@ -965,6 +977,7 @@
     <field name="Tiler" size="1" start="2" type="bool"/>
     <field name="IDVS" size="1" start="3" type="bool"/>
     <field name="RT" size="1" start="4" type="bool"/>
+    <field name="Neural" size="1" start="5" type="bool"/>
     <field name="Opcode" size="8" start="56" type="CS Opcode" default="REQ_RESOURCE"/>
   </struct>
 
@@ -2388,7 +2401,7 @@
 
   <struct name="VRS Image" size="2">
     <field name="VRS Image Rate" size="3" start="0" type="VRS Image Rate"/>
-    <field name="VRS Image Plane" size="59" start="5" type="address"/>
+    <field name="VRS Image Plane" size="59" start="5" type="address" modifier="shr(5)"/>
   </struct>
 
   <struct name="CRC" align="64" size="16">
@@ -2693,7 +2706,8 @@
   </struct>
 
   <struct name="Tiler Context" size="32" align="64">
-    <field name="Polygon List" size="64" start="0:0" type="address"/>
+    <field name="Polygon List" size="48" start="0:0" type="address"/>
+    <field name="Polygon List Flags" size="16" start="1:16" type="uint"/>
     <field name="Hierarchy Mask" size="13" start="2:0" type="uint"/>
     <field name="Sample Pattern" size="3" start="2:13" type="Sample Pattern"/>
     <field name="Sample test disable" size="1" start="2:17" type="bool"/>

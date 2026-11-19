@@ -6,7 +6,9 @@
 #include "vk_acceleration_structure.h"
 
 #include "bvh/panvk_bvh.h"
+#include "bvh/panvk_micromap.h"
 
+#include "panvk_cmd_alloc.h"
 #include "panvk_cmd_buffer.h"
 #include "panvk_cmd_dispatch.h"
 #include "panvk_cmd_meta.h"
@@ -14,11 +16,17 @@
 #include "panvk_entrypoints.h"
 #include "panvk_instance.h"
 #include "panvk_meta.h"
+#include "panvk_micromap.h"
 #include "panvk_physical_device.h"
 #include "panvk_priv_bo.h"
 #include "panvk_ray_tracing.h"
 
 #include "pan_props.h"
+#include "util/u_debug.h"
+
+static const uint32_t leaf_spv[] = {
+#include "bvh/leaf.spv.h"
+};
 
 static const uint32_t encode_spv[] = {
 #include "bvh/encode.spv.h"
@@ -26,6 +34,10 @@ static const uint32_t encode_spv[] = {
 
 static const uint32_t copy_spv[] = {
 #include "bvh/copy.spv.h"
+};
+
+static const uint32_t update_spv[] = {
+#include "bvh/update.spv.h"
 };
 
 static_assert(sizeof(struct panvk_bvh_header) == PANVK_BVH_HEADER_SIZE,
@@ -46,6 +58,7 @@ static_assert(sizeof(struct panvk_bvh_instance_leaf) == PANVK_BVH_NODE_SIZE,
               "unexpected instance leaf size");
 
 #define PANVK_BVH_ENCODE_WG_SIZE 64
+#define PANVK_BVH_UPDATE_WG_SIZE 64
 #define PANVK_BVH_COPY_WG_COUNT  64
 
 static uint32_t
@@ -79,6 +92,30 @@ bvh_build_args(void)
       .bvh_bounds_offset = offsetof(struct panvk_bvh_header, bounds),
       .morton_sort_workgroup_size = 512,
       .morton_sort_kvs_per_thread = 2,
+      .has_update = true,
+      .has_tlas_update = true,
+   };
+}
+
+struct panvk_update_layout {
+   VkDeviceSize ready_offset;
+   VkDeviceSize bounds_offset;
+   VkDeviceSize size;
+};
+
+static struct panvk_update_layout
+update_layout(const struct vk_acceleration_structure_build_state *state)
+{
+   const VkGeometryTypeKHR type = vk_get_as_geometry_type(state->build_info);
+   const uint32_t boxes = bvh_leaf_base(type, state->leaf_node_count);
+   const VkDeviceSize nodes = (VkDeviceSize)boxes + state->leaf_node_count;
+   const VkDeviceSize bounds_offset =
+      ALIGN_POT((VkDeviceSize)boxes * sizeof(uint32_t), 8);
+
+   return (struct panvk_update_layout){
+      .ready_offset = 0,
+      .bounds_offset = bounds_offset,
+      .size = bounds_offset + nodes * sizeof(vk_aabb),
    };
 }
 
@@ -86,7 +123,7 @@ static VkResult
 bind_bvh_pipeline(VkCommandBuffer commandBuffer,
                   const struct vk_acceleration_structure_build_args *args,
                   enum panvk_meta_object_key_type key, const uint32_t *spv,
-                  uint32_t spv_size, uint32_t push_size,
+                  uint32_t spv_size, uint32_t push_size, uint32_t flags,
                   VkPipelineLayout *layout)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
@@ -95,7 +132,7 @@ bind_bvh_pipeline(VkCommandBuffer commandBuffer,
 
    VkResult result = vk_get_bvh_build_pipeline_spv(
       &dev->vk, &dev->meta, (enum vk_meta_object_key_type)key, spv, spv_size,
-      push_size, args, 0, &pipeline, false);
+      push_size, args, flags, &pipeline, false);
    if (result == VK_SUCCESS)
       result = vk_get_bvh_build_pipeline_layout(&dev->vk, &dev->meta,
                                                 push_size, layout);
@@ -110,11 +147,341 @@ bind_bvh_pipeline(VkCommandBuffer commandBuffer,
 }
 
 static VkDeviceSize
+omm_primitive_offset(const struct vk_acceleration_structure_build_state *state)
+{
+   const VkGeometryTypeKHR type = vk_get_as_geometry_type(state->build_info);
+   VkDeviceSize size = bvh_size(type, state->leaf_node_count);
+
+   if (state->config.updateable)
+      size += ((VkDeviceSize)bvh_leaf_base(type, state->leaf_node_count) +
+               state->leaf_node_count) *
+              sizeof(uint32_t);
+
+   return size;
+}
+
+static bool
+has_omm(const VkAccelerationStructureBuildGeometryInfoKHR *info)
+{
+   for (uint32_t i = 0; i < info->geometryCount; i++) {
+      const VkAccelerationStructureGeometryKHR *geometry =
+         info->pGeometries ? &info->pGeometries[i] : info->ppGeometries[i];
+      if (geometry->geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+          vk_find_struct_const(geometry->geometry.triangles.pNext,
+                               ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT))
+         return true;
+   }
+   return false;
+}
+
+static VkDeviceSize
 get_as_size(VkDevice device,
             const struct vk_acceleration_structure_build_state *state)
 {
-   return bvh_size(vk_get_as_geometry_type(state->build_info),
-                   state->leaf_node_count);
+   VkDeviceSize size = omm_primitive_offset(state);
+   if (has_omm(state->build_info))
+      size = ALIGN_POT(size + (VkDeviceSize)state->leaf_node_count * sizeof(uint32_t), 8) +
+             (VkDeviceSize)state->build_info->geometryCount * sizeof(uint64_t);
+   return size;
+}
+
+static uint64_t
+omm_geometries(struct panvk_cmd_buffer *cmd,
+                const VkAccelerationStructureBuildGeometryInfoKHR *info)
+{
+   if (!has_omm(info))
+      return 0;
+
+   struct pan_ptr ptr = panvk_cmd_alloc_dev_mem(
+      cmd, desc, info->geometryCount * sizeof(struct panvk_omm_geometry), 8);
+   if (!ptr.gpu)
+      return 0;
+
+   struct panvk_omm_geometry *geometries = ptr.cpu;
+   memset(geometries, 0, info->geometryCount * sizeof(*geometries));
+   for (uint32_t i = 0; i < info->geometryCount; i++) {
+      const VkAccelerationStructureGeometryKHR *geometry =
+         info->pGeometries ? &info->pGeometries[i] : info->ppGeometries[i];
+      const VkAccelerationStructureTrianglesOpacityMicromapEXT *omm =
+         vk_find_struct_const(geometry->geometry.triangles.pNext,
+                               ACCELERATION_STRUCTURE_TRIANGLES_OPACITY_MICROMAP_EXT);
+      if (!omm)
+         continue;
+      VK_FROM_HANDLE(panvk_micromap, micromap, omm->micromap);
+      geometries[i] = (struct panvk_omm_geometry){
+         .micromap = micromap ? panvk_micromap_address(micromap) : 0,
+         .indices = omm->indexBuffer.deviceAddress,
+         .buffer_base = micromap ? panvk_micromap_address(micromap) - micromap->offset : 0,
+         .index_format = omm->indexType,
+         .index_stride = omm->indexStride,
+         .base_triangle = omm->baseTriangle,
+         .enabled = true,
+      };
+   }
+   return ptr.gpu;
+}
+
+static VkDeviceSize
+get_update_scratch_size(VkDevice device,
+                        const struct vk_acceleration_structure_build_state *state)
+{
+   return update_layout(state).size;
+}
+
+static void
+init_update_scratch(VkCommandBuffer commandBuffer,
+                    const struct vk_acceleration_structure_build_state *states,
+                    uint32_t build_count)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+
+   for (uint32_t i = 0; i < build_count; i++) {
+      const struct vk_acceleration_structure_build_state *state = &states[i];
+      if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
+
+      const struct panvk_update_layout layout = update_layout(state);
+      dev->vk.cmd_fill_buffer_addr(
+         commandBuffer,
+         state->build_info->scratchData.deviceAddress + layout.ready_offset,
+         layout.bounds_offset - layout.ready_offset, 0);
+   }
+}
+
+static void
+dispatch_copy(VkCommandBuffer commandBuffer,
+              const struct vk_acceleration_structure_build_args *args,
+              uint64_t src, uint64_t dst, uint32_t mode)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   const struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+   const struct panvk_instance *instance =
+      to_panvk_instance(phys_dev->vk.instance);
+   struct panvk_copy_args push = {
+      .src_addr = src,
+      .dst_addr = dst,
+      .mode = mode,
+   };
+   VkPipelineLayout layout;
+
+   memcpy(push.uuid, instance->driver_build_sha, VK_UUID_SIZE);
+   memcpy(push.uuid + VK_UUID_SIZE / 4, phys_dev->cache_uuid, VK_UUID_SIZE);
+
+   if (bind_bvh_pipeline(commandBuffer, args, PANVK_META_OBJECT_KEY_BVH_COPY,
+                         copy_spv, sizeof(copy_spv), sizeof(push), 0,
+                         &layout) != VK_SUCCESS)
+      return;
+
+   dev->vk.dispatch_table.CmdPushConstants(commandBuffer, layout,
+                                           VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                           sizeof(push), &push);
+   dev->vk.dispatch_table.CmdDispatch(commandBuffer, PANVK_BVH_COPY_WG_COUNT,
+                                      1, 1);
+}
+
+static void
+update_as(VkCommandBuffer commandBuffer, struct vk_device *device,
+          const struct vk_acceleration_structure_build_args *args,
+          struct vk_acceleration_structure_build_state *states,
+          uint32_t build_count)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VkPipelineLayout layout;
+   bool copied = false;
+
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+
+   for (uint32_t i = 0; i < build_count; i++) {
+      const VkAccelerationStructureBuildGeometryInfoKHR *info =
+         states[i].build_info;
+      if (states[i].config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE ||
+          info->srcAccelerationStructure == info->dstAccelerationStructure)
+         continue;
+
+      VK_FROM_HANDLE(vk_acceleration_structure, src,
+                     info->srcAccelerationStructure);
+      VK_FROM_HANDLE(vk_acceleration_structure, dst,
+                     info->dstAccelerationStructure);
+      dispatch_copy(commandBuffer, args, vk_acceleration_structure_get_va(src),
+                    vk_acceleration_structure_get_va(dst),
+                    PANVK_COPY_MODE_COPY);
+      copied = true;
+   }
+
+   if (copied)
+      vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+
+   if (bind_bvh_pipeline(commandBuffer, args, PANVK_META_OBJECT_KEY_BVH_UPDATE,
+                         update_spv, sizeof(update_spv),
+                         sizeof(struct panvk_update_args), 0,
+                         &layout) != VK_SUCCESS)
+      return;
+
+   for (uint32_t i = 0; i < build_count; i++) {
+      const struct vk_acceleration_structure_build_state *state = &states[i];
+      const VkAccelerationStructureBuildGeometryInfoKHR *info =
+         state->build_info;
+      if (state->config.internal_type != VK_INTERNAL_BUILD_TYPE_UPDATE ||
+          !state->leaf_node_count)
+         continue;
+
+      struct pan_ptr geometries = panvk_cmd_alloc_dev_mem(
+         cmdbuf, desc,
+         info->geometryCount * sizeof(struct vk_bvh_geometry_data),
+         sizeof(uint64_t));
+      if (!geometries.gpu)
+         return;
+
+      struct vk_bvh_geometry_data *geometry_data = geometries.cpu;
+      for (uint32_t j = 0; j < info->geometryCount; j++) {
+         const VkAccelerationStructureGeometryKHR *geometry =
+            info->pGeometries ? &info->pGeometries[j] : info->ppGeometries[j];
+         geometry_data[j] = vk_fill_geometry_data(
+            info->type, 0, j, geometry, &state->build_range_infos[j]);
+         if (state->indirect_address)
+            geometry_data[j].indirect_range = state->indirect_address +
+                                             (uint64_t)j * state->indirect_stride;
+      }
+
+      VK_FROM_HANDLE(vk_acceleration_structure, dst,
+                     info->dstAccelerationStructure);
+      const struct panvk_update_layout scratch = update_layout(state);
+      const uint64_t scratch_addr = info->scratchData.deviceAddress;
+      const struct panvk_update_args push = {
+         .bvh = vk_acceleration_structure_get_va(dst),
+         .geometries = geometries.gpu,
+         .ready = scratch_addr + scratch.ready_offset,
+         .bounds = scratch_addr + scratch.bounds_offset,
+         .geometry_type = vk_get_as_geometry_type(info),
+         .omm_geometries = omm_geometries(cmdbuf, info),
+      };
+
+      device->dispatch_table.CmdPushConstants(commandBuffer, layout,
+                                              VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                              sizeof(push), &push);
+      device->dispatch_table.CmdDispatch(
+         commandBuffer,
+         DIV_ROUND_UP(state->leaf_node_count, PANVK_BVH_UPDATE_WG_SIZE), 1, 1);
+   }
+}
+
+static uint64_t
+encode_scratch_addr(const struct vk_acceleration_structure_build_state *state)
+{
+   return state->build_info->scratchData.deviceAddress +
+          state->scratch.header_offset + sizeof(struct vk_ir_header);
+}
+
+static VkDeviceSize
+get_encode_scratch_size(VkDevice device,
+                        const struct vk_acceleration_structure_build_state *state)
+{
+   return (VkDeviceSize)MAX2(state->internal_node_count, 1) *
+          sizeof(struct panvk_encode_node);
+}
+
+static void
+get_build_config(VkDevice device,
+                 struct vk_acceleration_structure_build_state *state)
+{
+   if (vk_get_as_geometry_type(state->build_info) ==
+          VK_GEOMETRY_TYPE_INSTANCES_KHR &&
+       !state->config.updateable && !state->indirect_address && PAN_ARCH == 15 &&
+       debug_get_bool_option("PANVK_TLAS_SPLIT", false)) {
+      state->config.leaf_count_multiplier = PANVK_BVH_MAX_CHILDREN;
+      state->config.leaf_count_limit = 0xffffff;
+      state->config.build_flags |= VK_BUILD_FLAG_SPLIT_INSTANCES;
+   }
+   if (vk_get_as_geometry_type(state->build_info) ==
+          VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+       !state->config.updateable && !has_omm(state->build_info)) {
+      state->config.early_pair_compression = true;
+      state->config.late_pair_compression = true;
+   }
+}
+
+static void
+encode_builds(VkCommandBuffer commandBuffer, struct vk_device *device,
+              const struct vk_acceleration_structure_build_args *args,
+              struct vk_acceleration_structure_build_state *states,
+              uint32_t build_count)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   VkPipelineLayout layout;
+   uint32_t bound_flags = ~0u;
+
+   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+
+   for (uint32_t i = 0; i < build_count; i++) {
+      const struct vk_acceleration_structure_build_state *state = &states[i];
+      if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+         continue;
+
+      device->cmd_fill_buffer_addr(commandBuffer, encode_scratch_addr(state),
+                                   get_encode_scratch_size(NULL, state), 0);
+   }
+
+   for (uint32_t pass = PANVK_ENCODE_PASS_COLLAPSE;
+        pass <= PANVK_ENCODE_PASS_WRITE; pass++) {
+      vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
+
+      for (uint32_t i = 0; i < build_count; i++) {
+         const struct vk_acceleration_structure_build_state *state = &states[i];
+         if (state->config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+            continue;
+
+         const uint32_t flags =
+            state->config.build_flags & VK_BUILD_FLAG_HAS_QUADS;
+         if (flags != bound_flags) {
+            if (bind_bvh_pipeline(commandBuffer, args,
+                                  PANVK_META_OBJECT_KEY_BVH_ENCODE, encode_spv,
+                                  sizeof(encode_spv),
+                                  sizeof(struct panvk_encode_args), flags,
+                                  &layout) != VK_SUCCESS)
+               return;
+            bound_flags = flags;
+         }
+
+         VK_FROM_HANDLE(vk_acceleration_structure, dst,
+                        state->build_info->dstAccelerationStructure);
+         VkGeometryTypeKHR type = vk_get_as_geometry_type(state->build_info);
+         uint64_t scratch = state->build_info->scratchData.deviceAddress;
+         uint64_t omm = pass == PANVK_ENCODE_PASS_WRITE ?
+            omm_geometries(cmdbuf, state->build_info) : 0;
+         if (pass == PANVK_ENCODE_PASS_WRITE && has_omm(state->build_info) && !omm)
+            return;
+         const struct panvk_encode_args push = {
+            .intermediate_bvh = scratch + state->scratch.ir_offset,
+            .output_bvh = vk_acceleration_structure_get_va(dst),
+            .header = scratch + state->scratch.header_offset,
+            .nodes = encode_scratch_addr(state),
+            .leaf_node_count = state->leaf_node_count,
+            .leaf_base = bvh_leaf_base(type, state->leaf_node_count),
+            .geometry_type = type,
+            .geometry_count = state->build_info->geometryCount,
+            .updateable = state->config.updateable,
+            .pass = pass,
+            .omm_geometries = omm,
+            .omm_primitive_offset = has_omm(state->build_info) ?
+               omm_primitive_offset(state) : 0,
+            .omm_geometry_offset = has_omm(state->build_info) ?
+               ALIGN_POT(omm_primitive_offset(state) +
+                         (VkDeviceSize)state->leaf_node_count * sizeof(uint32_t), 8) : 0,
+         };
+
+         device->dispatch_table.CmdPushConstants(commandBuffer, layout,
+                                                 VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                                 sizeof(push), &push);
+         device->dispatch_table.CmdDispatch(
+            commandBuffer,
+            DIV_ROUND_UP(MAX2(state->internal_node_count, 1),
+                         PANVK_BVH_ENCODE_WG_SIZE),
+            1, 1);
+      }
+   }
 }
 
 static void
@@ -124,44 +491,30 @@ encode_as(VkCommandBuffer commandBuffer, struct vk_device *device,
           struct vk_acceleration_structure_build_state *states,
           uint32_t build_count, bool flushed_compute_after_init_update_scratch)
 {
-   VkPipelineLayout layout;
-
-   vk_bvh_build_barrier_compute_to_compute(commandBuffer, false);
-
-   if (bind_bvh_pipeline(commandBuffer, args, PANVK_META_OBJECT_KEY_BVH_ENCODE,
-                         encode_spv, sizeof(encode_spv),
-                         sizeof(struct panvk_encode_args),
-                         &layout) != VK_SUCCESS)
-      return;
+   bool any_build = false;
+   bool any_update = false;
 
    for (uint32_t i = 0; i < build_count; i++) {
-      const struct vk_acceleration_structure_build_state *state = &states[i];
-      VK_FROM_HANDLE(vk_acceleration_structure, dst,
-                     state->build_info->dstAccelerationStructure);
-      VkGeometryTypeKHR type = vk_get_as_geometry_type(state->build_info);
-      uint64_t scratch = state->build_info->scratchData.deviceAddress;
-      const struct panvk_encode_args push = {
-         .intermediate_bvh = scratch + state->scratch.ir_offset,
-         .output_bvh = vk_acceleration_structure_get_va(dst),
-         .header = scratch + state->scratch.header_offset,
-         .leaf_node_count = state->leaf_node_count,
-         .leaf_base = bvh_leaf_base(type, state->leaf_node_count),
-         .geometry_type = type,
-         .geometry_count = state->build_info->geometryCount,
-      };
-
-      device->dispatch_table.CmdPushConstants(commandBuffer, layout,
-                                              VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                              sizeof(push), &push);
-      device->dispatch_table.CmdDispatch(
-         commandBuffer,
-         DIV_ROUND_UP(state->internal_node_count, PANVK_BVH_ENCODE_WG_SIZE),
-         1, 1);
+      if (states[i].config.internal_type == VK_INTERNAL_BUILD_TYPE_UPDATE)
+         any_update = true;
+      else
+         any_build = true;
    }
+
+   if (any_build)
+      encode_builds(commandBuffer, device, args, states, build_count);
+   if (any_update)
+      update_as(commandBuffer, device, args, states, build_count);
 }
 
 static const struct vk_acceleration_structure_build_ops as_build_ops = {
+   .leaf_spirv_override = leaf_spv,
+   .leaf_spirv_override_size = sizeof(leaf_spv),
+   .get_build_config = get_build_config,
+   .get_encode_scratch_size = get_encode_scratch_size,
    .get_as_size = get_as_size,
+   .get_update_scratch_size = get_update_scratch_size,
+   .init_update_scratch = init_update_scratch,
    .encode = encode_as,
 };
 
@@ -286,38 +639,60 @@ panvk_per_arch(CmdBuildAccelerationStructuresKHR)(
    panvk_per_arch(cmd_meta_compute_end)(cmdbuf, &save);
 }
 
+VKAPI_ATTR void VKAPI_CALL
+panvk_per_arch(CmdBuildAccelerationStructuresIndirectKHR)(
+   VkCommandBuffer commandBuffer, uint32_t infoCount,
+   const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
+   const VkDeviceAddress *pIndirectDeviceAddresses,
+   const uint32_t *pIndirectStrides,
+   const uint32_t *const *ppMaxPrimitiveCounts)
+{
+   VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct vk_acceleration_structure_build_args args = bvh_build_args();
+   struct panvk_cmd_meta_compute_save_ctx save = {0};
+   size_t range_count = 0;
+   for (uint32_t i = 0; i < infoCount; i++)
+      range_count += pInfos[i].geometryCount;
+
+   const VkAccelerationStructureBuildRangeInfoKHR **ranges =
+      calloc(MAX2(infoCount, 1), sizeof(*ranges));
+   VkAccelerationStructureBuildRangeInfoKHR *storage =
+      calloc(MAX2(range_count, 1), sizeof(*storage));
+   if (!ranges || !storage) {
+      free(ranges);
+      free(storage);
+      vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+      return;
+   }
+
+   size_t offset = 0;
+   for (uint32_t i = 0; i < infoCount; i++) {
+      ranges[i] = storage + offset;
+      for (uint32_t j = 0; j < pInfos[i].geometryCount; j++)
+         storage[offset++].primitiveCount = ppMaxPrimitiveCounts[i][j];
+   }
+
+   args.indirect_addresses = pIndirectDeviceAddresses;
+   args.indirect_strides = pIndirectStrides;
+   panvk_per_arch(cmd_meta_compute_start)(cmdbuf, &save);
+   vk_cmd_build_acceleration_structures(commandBuffer, &dev->vk, &dev->meta,
+                                        infoCount, pInfos, ranges, &args);
+   panvk_per_arch(cmd_meta_compute_end)(cmdbuf, &save);
+   free(storage);
+   free(ranges);
+}
+
 static void
 cmd_copy_as(VkCommandBuffer commandBuffer, uint64_t src, uint64_t dst,
             uint32_t mode)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
-   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   const struct panvk_physical_device *phys_dev =
-      to_panvk_physical_device(dev->vk.physical);
-   const struct panvk_instance *instance =
-      to_panvk_instance(phys_dev->vk.instance);
    const struct vk_acceleration_structure_build_args args = bvh_build_args();
    struct panvk_cmd_meta_compute_save_ctx save = {0};
-   struct panvk_copy_args push = {
-      .src_addr = src,
-      .dst_addr = dst,
-      .mode = mode,
-   };
-   VkPipelineLayout layout;
-
-   memcpy(push.uuid, instance->driver_build_sha, VK_UUID_SIZE);
-   memcpy(push.uuid + VK_UUID_SIZE / 4, phys_dev->cache_uuid, VK_UUID_SIZE);
 
    panvk_per_arch(cmd_meta_compute_start)(cmdbuf, &save);
-   if (bind_bvh_pipeline(commandBuffer, &args, PANVK_META_OBJECT_KEY_BVH_COPY,
-                         copy_spv, sizeof(copy_spv), sizeof(push),
-                         &layout) == VK_SUCCESS) {
-      dev->vk.dispatch_table.CmdPushConstants(commandBuffer, layout,
-                                              VK_SHADER_STAGE_COMPUTE_BIT, 0,
-                                              sizeof(push), &push);
-      dev->vk.dispatch_table.CmdDispatch(commandBuffer,
-                                         PANVK_BVH_COPY_WG_COUNT, 1, 1);
-   }
+   dispatch_copy(commandBuffer, &args, src, dst, mode);
    panvk_per_arch(cmd_meta_compute_end)(cmdbuf, &save);
 }
 

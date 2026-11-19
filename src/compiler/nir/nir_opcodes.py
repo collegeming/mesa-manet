@@ -1048,6 +1048,13 @@ binop("fmin", tfloat, _2src_commutative + associative, ("util_min_num(src0, src1
 binop("fmax", tfloat, _2src_commutative + associative, ("util_max_num(src0, src1)"),
       valid_fp_math_ctrl = preserve_sz_inf_nan)
 
+binop("fmin_nan_pan", tfloat32, _2src_commutative + associative,
+      "(isnan(src0) || isnan(src1)) ? NAN : util_min_num(src0, src1)",
+      valid_fp_math_ctrl = preserve_sz_inf_nan)
+binop("fmax_nan_pan", tfloat32, _2src_commutative + associative,
+      "(isnan(src0) || isnan(src1)) ? NAN : util_max_num(src0, src1)",
+      valid_fp_math_ctrl = preserve_sz_inf_nan)
+
 binop("imin", tint, _2src_commutative + associative, "MIN2(src0, src1)")
 binop("umin", tuint, _2src_commutative + associative, "MIN2(src0, src1)")
 binop("imax", tint, _2src_commutative + associative, "MAX2(src0, src1)")
@@ -1501,6 +1508,11 @@ def triop_shift_pan(name, type0, shift_expr):
 
 triop_shift_pan("arshift", tint, "src0 >> shift")
 triop_shift_pan("lshift", tuint, "src0 << shift")
+for name, index_type in [("shadd", tuint64), ("shadd_u32", tuint32),
+                         ("shadd_s32", tint32)]:
+    opcode(name + "_pan", 0, tuint64, [0, 0, 0],
+           [tuint64, index_type, tuint32], False, "",
+           "src0 + ((uint64_t)src1 << (src2 & 63))")
 triop_shift_pan("rshift", tuint, "src0 >> shift")
 triop_shift_pan("lrot", tuint, "(src0 << shift) |\
                                 (src0 >> ((-shift) & shift_mask))")

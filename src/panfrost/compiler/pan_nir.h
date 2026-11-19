@@ -12,9 +12,20 @@
 
 struct util_format_description;
 
+bool pan_nir_opt_phi_alu(nir_shader *shader);
+bool pan_nir_link_varyings(nir_shader *producer, nir_shader *consumer);
+bool pan_nir_lower_robust_image_access2(nir_shader *shader);
+
 nir_shader *pan_nir_opt_preamble(nir_shader *nir,
                                const struct pan_compile_inputs *inputs,
-                               nir_shader **preamble, unsigned *fau_words);
+                               nir_shader **preamble,
+                               struct pan_fau_virtual *virt);
+
+void pan_nir_pilot_place_results(nir_shader *pilot,
+                                 const struct pan_fau_virtual *virt);
+
+bool pan_nir_pilot_add_fau_copies(nir_shader **pilot, const nir_shader *nir,
+                                  const struct pan_fau_layout *fau);
 
 #define PAN_NIR_SET_BLAKE3_INTERNAL(nir, key)                                  \
    _mesa_blake3_compute(key, sizeof(*key), nir->info.source_blake3)
@@ -267,6 +278,28 @@ bool pan_nir_lower_image_64bit(nir_shader *shader);
 bool pan_nir_lower_var_special_pan(nir_shader *shader);
 bool pan_nir_lower_noperspective_vs(nir_shader *shader);
 
+static inline nir_def *
+pan_nir_viewport_transform(nir_builder *b, nir_def *pos, nir_def *scale,
+                           nir_def *offset)
+{
+   nir_def *w = nir_channel(b, pos, 3);
+   nir_def *w_recip = nir_fclamp(b, nir_frcp(b, w),
+                                 nir_imm_float(b, -(float)(1 << 15)),
+                                 nir_imm_float(b, (float)(1 << 15)));
+   nir_def *ndc = nir_fmul(b, nir_trim_vector(b, pos, 3), w_recip);
+   nir_def *z_inside = nir_fge(b, nir_fabs(b, w),
+                               nir_fabs(b, nir_channel(b, pos, 2)));
+   nir_def *z_ndc = nir_channel(b, ndc, 2);
+   z_ndc = nir_bcsel(b, z_inside, nir_fsat_signed(b, z_ndc), z_ndc);
+   ndc = nir_vector_insert_imm(b, ndc, z_ndc, 2);
+
+   nir_def *screen = nir_fadd(b, nir_fmul(b, ndc, scale), offset);
+   return nir_vec4(b, nir_channel(b, screen, 0), nir_channel(b, screen, 1),
+                   nir_channel(b, screen, 2), w_recip);
+}
+
+bool pan_nir_lower_viewport_transform(nir_shader *shader);
+
 bool pan_nir_lower_vs_inputs(nir_shader *shader, uint64_t gpu_id);
 
 bool pan_nir_lower_vs_outputs(nir_shader *shader, uint64_t gpu_id,
@@ -336,7 +369,8 @@ struct pan_va_tex_flags {
     * from the raw direction vector.
     */
    unsigned projection_enable : 1;
-   unsigned _pad : 19;
+   unsigned integer_coordinates : 1;
+   unsigned _pad : 18;
 };
 PRAGMA_DIAGNOSTIC_POP
 static_assert(sizeof(struct pan_va_tex_flags) == 4, "Must fit in uint32_t");
@@ -382,7 +416,11 @@ bool pan_nir_lower_framebuffer(nir_shader *shader,
                                bool broken_ld_special);
 
 bool pan_nir_lower_fs_outputs(nir_shader *shader, bool skip_atest,
-                              unsigned fragcolor_nr_cbufs);
+                              unsigned fragcolor_nr_cbufs,
+                              uint8_t trim_color_locs, bool early_atest);
+
+bool pan_nir_move_atest_after_discards(nir_shader *shader);
+bool pan_nir_fs_reads_zs_tile(nir_shader *shader);
 
 uint32_t pan_nir_collect_noperspective_varyings_fs(nir_shader *s);
 
@@ -395,7 +433,11 @@ bool pan_nir_fuse_io_cvt(nir_shader *nir, uint64_t gpu_id,
 
 bool pan_nir_opt_push_ubo(nir_shader *nir,
                           const struct pan_compile_inputs *inputs,
-                          struct pan_fau_layout *fau,
+                          struct pan_fau_virtual *virt, unsigned budget,
                           uint32_t *ubo_mask_out);
+
+#define PAN_UBO_PUSH_CONST_RATIO 4
+
+bool pan_nir_opt_shadd(nir_shader *nir, unsigned arch);
 
 #endif /* __PAN_NIR_H__ */

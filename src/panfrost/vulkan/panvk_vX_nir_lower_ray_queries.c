@@ -6,10 +6,12 @@
 #include "compiler/spirv/spirv.h"
 #include "nir_builder.h"
 #include "nir_deref.h"
+#include "util/bitset.h"
 #include "util/hash_table.h"
 
 #include "bvh/panvk_bvh.h"
 #include "panvk_ray_tracing.h"
+#include "panvk_nir_rt_traversal.h"
 #include "panvk_shader.h"
 
 #define RQ_COMMITTED   0x24
@@ -20,20 +22,21 @@
 #define RQ_REC_KIND    0x10
 #define RQ_REC_DWORDS  7
 
-#define RQ_STATUS_TRIANGLE  1
-#define RQ_STATUS_AABB      2
-#define RQ_STATUS_HIT       5
-#define RQ_STATUS_GENERATED 7
-
-#define RQ_COMMITTED_FROM_RECORD 0xffffffffu
+#define RQ_STATUS_AABB 2
+#define RQ_STATUS_HIT  5
 
 #define RQ_KIND_COMMIT    0x80000000u
 #define RQ_KIND_GENERATED 0xe0000000u
 
+#define RQ_FLAGS_MASK      0x7f7u
+#define RQ_FLAGS_FAST_MASK 0x577u
+#define RQ_FLAGS_FAST                                                          \
+   (SpvRayFlagsCullNoOpaqueKHRMask | SpvRayFlagsSkipAABBsKHRMask)
+
 enum rq_field {
    rq_field_accel_struct,
    rq_field_status,
-   rq_field_pending,
+   rq_field_started,
    rq_field_terminated,
    rq_field_origin,
    rq_field_direction,
@@ -41,12 +44,23 @@ enum rq_field {
    rq_field_flags,
    rq_field_committed_t,
    rq_field_committed_type,
+   rq_field_commit_t,
+   rq_field_cand_lo,
+   rq_field_cand_hi,
+   rq_field_comm_lo,
+   rq_field_comm_hi,
    rq_field_count,
 };
 
 struct rq_var {
    nir_variable *var;
    uint32_t slot;
+   bool has_proceed;
+   bool fast;
+   bool candidates;
+   bool resume;
+   bool records;
+   unsigned eager;
 };
 
 struct lower_rq_ctx {
@@ -54,6 +68,7 @@ struct lower_rq_ctx {
    nir_def *lane_index;
    nir_def *lane_count;
    uint32_t slot_count;
+   uint32_t frame_offset;
 };
 
 static const struct glsl_type *
@@ -69,18 +84,32 @@ rq_type(void)
 
    FIELD(accel_struct, glsl_uint64_t_type());
    FIELD(status, glsl_uint_type());
-   FIELD(pending, glsl_bool_type());
+   FIELD(started, glsl_bool_type());
    FIELD(terminated, glsl_bool_type());
    FIELD(origin, glsl_vec_type(3));
    FIELD(direction, glsl_vec_type(3));
    FIELD(tmin, glsl_float_type());
    FIELD(flags, glsl_uint_type());
-   FIELD(committed_t, glsl_float_type());
+   FIELD(committed_t, glsl_uint_type());
    FIELD(committed_type, glsl_uint_type());
+   FIELD(commit_t, glsl_uint_type());
+   FIELD(cand_lo, glsl_vec_type(4));
+   FIELD(cand_hi, glsl_vec_type(3));
+   FIELD(comm_lo, glsl_vec_type(4));
+   FIELD(comm_hi, glsl_vec_type(3));
 
 #undef FIELD
 
    return glsl_struct_type(fields, rq_field_count, "panvk_ray_query", false);
+}
+
+static struct rq_var *
+rq_var_get(struct lower_rq_ctx *ctx, nir_intrinsic_instr *intr)
+{
+   struct hash_entry *entry =
+      _mesa_hash_table_search(ctx->vars, nir_intrinsic_get_var(intr, 0));
+   assert(entry);
+   return entry->data;
 }
 
 static nir_deref_instr *
@@ -124,6 +153,12 @@ rq_deref(nir_builder *b, struct lower_rq_ctx *ctx, nir_def *def,
 static nir_def *
 rq_state_addr(nir_builder *b, struct lower_rq_ctx *ctx, nir_def *slot)
 {
+   if (ctx->frame_offset) {
+      nir_def *root = nir_load_rt_arg_pan(b, 64, .base = 2);
+      nir_def *base = nir_iand_imm(b, nir_load_rt_arg_pan(b, 32, .base = 12), 0xffff);
+      return panvk_nir_rt_state_addr(b, root,
+         nir_iadd(b, base, nir_iadd_imm(b, slot, 1)));
+   }
    nir_def *index =
       nir_iadd(b, nir_imul(b, slot, ctx->lane_count), ctx->lane_index);
 
@@ -159,39 +194,65 @@ root_node(nir_builder *b, nir_def *as)
                     nir_imm_int64(b, 0));
 }
 
-static void
-rt_barrier(nir_builder *b)
+static nir_def *
+status_code(nir_builder *b, nir_def *status)
 {
-   nir_barrier(b, .execution_scope = SCOPE_NONE,
-               .memory_scope = SCOPE_SUBGROUP,
-               .memory_semantics = NIR_MEMORY_ACQ_REL,
-               .memory_modes = nir_var_mem_global);
+   return nir_ushr_imm(b, status, 29);
+}
+
+static nir_def *
+status_is_candidate(nir_builder *b, nir_def *status)
+{
+   return nir_ult_imm(b, nir_iadd_imm(b, status_code(b, status), -1), 2);
+}
+
+static nir_def *
+status_is_hit(nir_builder *b, nir_def *status)
+{
+   return nir_ieq_imm(b, nir_iand_imm(b, status, 0xe0000000u),
+                      RQ_STATUS_HIT << 29);
 }
 
 static void
-store_trace_result(nir_builder *b, nir_deref_instr *rq, nir_def *out)
+store_trace_result(nir_builder *b, nir_deref_instr *rq, nir_def *out,
+                   const struct rq_var *info, nir_def *state)
 {
-   nir_def *status = nir_channel(b, out, 0);
-   nir_def *code = nir_ushr_imm(b, status, 29);
-   nir_def *type =
-      nir_bcsel(b, nir_ieq_imm(b, code, RQ_STATUS_HIT), nir_imm_int(b, 1),
-                nir_bcsel(b, nir_ieq_imm(b, code, 0), nir_imm_int(b, 0),
-                          nir_bcsel(b, nir_ult_imm(b, code, RQ_STATUS_AABB + 1),
-                                    nir_imm_int(b, RQ_COMMITTED_FROM_RECORD),
-                                    nir_imm_int(b, 2))));
-
-   rq_store(b, rq, status, status);
+   rq_store(b, rq, status, nir_channel(b, out, 0));
    rq_store(b, rq, committed_t, nir_channel(b, out, 1));
-   rq_store(b, rq, committed_type, type);
+
+   if (info->eager) {
+      rq_store(b, rq, cand_lo, load_state(b, state, RQ_CANDIDATE, 4));
+      rq_store(b, rq, cand_hi, load_state(b, state, RQ_CANDIDATE + 16, 3));
+   }
+   if (info->eager > 1) {
+      rq_store(b, rq, comm_lo, load_state(b, state, RQ_COMMITTED, 4));
+      rq_store(b, rq, comm_hi, load_state(b, state, RQ_COMMITTED + 16, 3));
+   }
+}
+
+static nir_def *
+record_load(nir_builder *b, nir_deref_instr *rq, const struct rq_var *info,
+            nir_def *state, bool committed, unsigned offset, unsigned comps)
+{
+   if (info->eager > (committed ? 1 : 0)) {
+      nir_def *lo = committed ? rq_load(b, rq, comm_lo) : rq_load(b, rq, cand_lo);
+      nir_def *hi = committed ? rq_load(b, rq, comm_hi) : rq_load(b, rq, cand_hi);
+      nir_def *c[RQ_REC_DWORDS];
+      for (unsigned i = 0; i < RQ_REC_DWORDS; i++)
+         c[i] = nir_channel(b, i < 4 ? lo : hi, i % 4);
+      return nir_vec(b, &c[offset / 4], comps);
+   }
+
+   return load_state(b, state, (committed ? RQ_COMMITTED : RQ_CANDIDATE) + offset,
+                     comps);
 }
 
 static void
 lower_rq_initialize(nir_builder *b, struct lower_rq_ctx *ctx,
-                    nir_intrinsic_instr *intr)
+                    const struct rq_var *info, nir_intrinsic_instr *intr)
 {
    nir_def *slot;
    nir_deref_instr *rq = rq_deref(b, ctx, intr->src[0].ssa, &slot);
-   nir_def *state = rq_state_addr(b, ctx, slot);
    nir_def *as = intr->src[1].ssa;
    nir_def *flags = intr->src[2].ssa;
    nir_def *cull_mask = intr->src[3].ssa;
@@ -205,65 +266,76 @@ lower_rq_initialize(nir_builder *b, struct lower_rq_ctx *ctx,
    rq_store(b, rq, direction, direction);
    rq_store(b, rq, tmin, tmin);
    rq_store(b, rq, flags, flags);
-
-   store_state(b, state, RQ_COMMITTED + RQ_REC_KIND, nir_imm_int(b, 0));
-
-   rt_barrier(b);
-   nir_def *out = nir_rt_trace_begin_pan(
-      b, state, root_node(b, as), origin, direction, tmin, tmax,
-      nir_ior(b, flags, nir_ishl_imm(b, nir_iand_imm(b, cull_mask, 0xff), 24)),
-      nir_imm_int(b, 0));
-   rt_barrier(b);
-   store_trace_result(b, rq, out);
-   rq_store(b, rq, pending, nir_imm_true(b));
+   rq_store(b, rq, committed_type, nir_imm_int(b, 0));
+   rq_store(b, rq, commit_t, tmax);
+   rq_store(b, rq, started, nir_imm_false(b));
    rq_store(b, rq, terminated, nir_imm_false(b));
-}
 
-static nir_def *
-status_is_candidate(nir_builder *b, nir_def *status)
-{
-   nir_def *code = nir_ushr_imm(b, status, 29);
+   nir_def *hw_flags =
+      info->fast ? nir_ior_imm(b, nir_iand_imm(b, flags, RQ_FLAGS_FAST_MASK),
+                               RQ_FLAGS_FAST)
+                 : nir_iand_imm(b, flags, RQ_FLAGS_MASK);
+   hw_flags = nir_ior(b, hw_flags,
+                      nir_ishl_imm(b, nir_iand_imm(b, cull_mask, 0xff), 24));
 
-   return nir_ior(b, nir_ieq_imm(b, code, RQ_STATUS_TRIANGLE),
-                  nir_ieq_imm(b, code, RQ_STATUS_AABB));
+   nir_def *state = info->records || info->resume
+                       ? rq_state_addr(b, ctx, slot)
+                       : nir_imm_int64(b, 0);
+
+   nir_def *out =
+      nir_rt_trace_begin_pan(b, state, root_node(b, as), origin, direction,
+                             tmin, tmax, hw_flags, nir_imm_int(b, 0));
+   store_trace_result(b, rq, out, info, state);
 }
 
 static nir_def *
 lower_rq_proceed(nir_builder *b, struct lower_rq_ctx *ctx,
-                 nir_intrinsic_instr *intr)
+                 const struct rq_var *info, nir_intrinsic_instr *intr)
 {
+   if (!info->candidates)
+      return nir_imm_false(b);
+
    nir_def *slot;
    nir_deref_instr *rq = rq_deref(b, ctx, intr->src[0].ssa, &slot);
-   nir_def *pending = rq_load(b, rq, pending);
-   nir_def *terminated = rq_load(b, rq, terminated);
-   nir_def *status = rq_load(b, rq, status);
 
-   nir_push_if(b, nir_iand(b, nir_inot(b, nir_ior(b, pending, terminated)),
-                           status_is_candidate(b, status)));
-   {
-      nir_def *state = rq_state_addr(b, ctx, slot);
-      nir_def *candidate = load_state(b, state, RQ_CANDIDATE + RQ_REC_PRIM, 2);
+   if (info->resume) {
+      nir_push_if(b, rq_load(b, rq, started));
+      {
+         nir_def *terminated = rq_load(b, rq, terminated);
+         nir_def *status = rq_load(b, rq, status);
 
-      rt_barrier(b);
-      nir_def *out = nir_rt_trace_resume_pan(
-         b, state, root_node(b, rq_load(b, rq, accel_struct)), candidate);
-      rt_barrier(b);
+         nir_push_if(b, nir_iand(b, nir_inot(b, terminated),
+                                 status_is_candidate(b, status)));
+         {
+            nir_def *state = rq_state_addr(b, ctx, slot);
+            nir_def *candidate =
+               record_load(b, rq, info, state, false, RQ_REC_PRIM, 2);
+            if (info->eager > 1) {
+               store_state(b, state, RQ_COMMITTED, rq_load(b, rq, comm_lo));
+               store_state(b, state, RQ_COMMITTED + 16, rq_load(b, rq, comm_hi));
+            }
+            nir_def *out = nir_rt_trace_resume_pan(
+               b, state, root_node(b, rq_load(b, rq, accel_struct)),
+               candidate);
+            store_trace_result(b, rq, out, info, state);
+         }
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_if(b, NULL);
 
-      store_trace_result(b, rq, out);
+      rq_store(b, rq, started, nir_imm_true(b));
    }
-   nir_pop_if(b, NULL);
-
-   rq_store(b, rq, pending, nir_imm_false(b));
 
    return nir_iand(b, nir_inot(b, rq_load(b, rq, terminated)),
                    status_is_candidate(b, rq_load(b, rq, status)));
 }
 
 static nir_def *
-commit_candidate(nir_builder *b, nir_def *state, nir_def *t, uint32_t kind_bits)
+commit_candidate(nir_builder *b, nir_deref_instr *rq, const struct rq_var *info,
+                 nir_def *state, nir_def *t, uint32_t kind_bits)
 {
-   nir_def *lo = load_state(b, state, RQ_CANDIDATE, 4);
-   nir_def *hi = load_state(b, state, RQ_CANDIDATE + 16, RQ_REC_DWORDS - 4);
+   nir_def *lo = record_load(b, rq, info, state, false, 0, 4);
+   nir_def *hi = record_load(b, rq, info, state, false, 16, RQ_REC_DWORDS - 4);
    nir_def *comps[RQ_REC_DWORDS];
 
    for (unsigned i = 0; i < RQ_REC_DWORDS; i++)
@@ -278,35 +350,32 @@ commit_candidate(nir_builder *b, nir_def *state, nir_def *t, uint32_t kind_bits)
                        kind_bits)
          : nir_ior_imm(b, comps[RQ_REC_KIND / 4], kind_bits);
 
-   store_state(b, state, RQ_COMMITTED, nir_vec(b, comps, 4));
-   store_state(b, state, RQ_COMMITTED + 16, nir_vec(b, &comps[4], 3));
+   if (info->eager > 1) {
+      rq_store(b, rq, comm_lo, nir_vec(b, comps, 4));
+      rq_store(b, rq, comm_hi, nir_vec(b, &comps[4], 3));
+   } else {
+      store_state(b, state, RQ_COMMITTED, nir_vec(b, comps, 4));
+      store_state(b, state, RQ_COMMITTED + 16, nir_vec(b, &comps[4], 3));
+   }
 
    return comps[RQ_REC_T / 4];
 }
 
 static void
-lower_rq_confirm_intersection(nir_builder *b, struct lower_rq_ctx *ctx,
-                              nir_intrinsic_instr *intr)
+lower_rq_commit(nir_builder *b, struct lower_rq_ctx *ctx,
+                const struct rq_var *info, nir_intrinsic_instr *intr,
+                bool generated)
 {
    nir_def *slot;
    nir_deref_instr *rq = rq_deref(b, ctx, intr->src[0].ssa, &slot);
+   nir_def *t = generated ? intr->src[1].ssa : NULL;
 
-   rq_store(b, rq, committed_t,
-            commit_candidate(b, rq_state_addr(b, ctx, slot), NULL, RQ_KIND_COMMIT));
-   rq_store(b, rq, committed_type, nir_imm_int(b, 1));
-}
+   t = commit_candidate(b, rq, info, rq_state_addr(b, ctx, slot), t,
+                        generated ? RQ_KIND_GENERATED : RQ_KIND_COMMIT);
 
-static void
-lower_rq_generate_intersection(nir_builder *b, struct lower_rq_ctx *ctx,
-                               nir_intrinsic_instr *intr)
-{
-   nir_def *slot;
-   nir_deref_instr *rq = rq_deref(b, ctx, intr->src[0].ssa, &slot);
-
-   rq_store(b, rq, committed_t,
-            commit_candidate(b, rq_state_addr(b, ctx, slot), intr->src[1].ssa,
-                             RQ_KIND_GENERATED));
-   rq_store(b, rq, committed_type, nir_imm_int(b, 2));
+   rq_store(b, rq, committed_t, t);
+   rq_store(b, rq, commit_t, t);
+   rq_store(b, rq, committed_type, nir_imm_int(b, generated ? 2 : 1));
 }
 
 static void
@@ -316,6 +385,26 @@ lower_rq_terminate(nir_builder *b, struct lower_rq_ctx *ctx,
    nir_deref_instr *rq = rq_deref(b, ctx, intr->src[0].ssa, NULL);
 
    rq_store(b, rq, terminated, nir_imm_true(b));
+}
+
+static nir_def *
+committed_type(nir_builder *b, nir_deref_instr *rq, const struct rq_var *info)
+{
+   nir_def *status = rq_load(b, rq, status);
+
+   if (!info->candidates)
+      return nir_b2i32(b, status_is_hit(b, status));
+
+   nir_def *done =
+      nir_bcsel(b, status_is_hit(b, status), nir_imm_int(b, 1),
+                nir_bcsel(b, nir_ieq_imm(b, status_code(b, status), 0),
+                          nir_imm_int(b, 0), nir_imm_int(b, 2)));
+   nir_def *pending =
+      nir_bcsel(b, nir_ine(b, rq_load(b, rq, committed_t),
+                           rq_load(b, rq, commit_t)),
+                nir_imm_int(b, 1), rq_load(b, rq, committed_type));
+
+   return nir_bcsel(b, status_is_candidate(b, status), pending, done);
 }
 
 static nir_def *
@@ -351,17 +440,7 @@ static nir_def *
 primitive_leaf_word(nir_builder *b, nir_def *as, nir_def *kind, nir_def *prim,
                     unsigned word)
 {
-   nir_def *inst = instance_leaf(b, as, kind);
-   nir_def *blas = load_as(b, nir_iadd_imm(b, inst, offsetof(struct panvk_bvh_instance_leaf, blas_ptr)), 1, 64);
-   nir_def *nodes = nir_iand_imm(b, blas, ~(PANVK_BVH_INSTANCE_AABBS | 0x3full));
-   nir_def *leaf =
-      nir_iadd(b, nodes, nir_u2u64(b, nir_imul_imm(b, nir_ushr_imm(b, prim, 2),
-                                                  PANVK_BVH_NODE_SIZE)));
-   nir_def *offset =
-      nir_isub(b, nir_imm_int(b, word * 4),
-               nir_imul_imm(b, nir_iand_imm(b, prim, 3), 4));
-
-   return load_as(b, nir_iadd(b, leaf, nir_u2u64(b, offset)), 1, 32);
+   return panvk_nir_rt_leaf_word(b, as, kind, prim, word);
 }
 
 static nir_def *
@@ -437,14 +516,14 @@ object_to_world_column(nir_builder *b, nir_def *rows[3], unsigned column)
    return nir_vec(b, res, 3);
 }
 
+
 static nir_def *
 lower_rq_load(nir_builder *b, struct lower_rq_ctx *ctx,
-              nir_intrinsic_instr *intr)
+              const struct rq_var *info, nir_intrinsic_instr *intr)
 {
    nir_def *slot;
    nir_deref_instr *rq = rq_deref(b, ctx, intr->src[0].ssa, &slot);
    bool committed = nir_intrinsic_committed(intr);
-   unsigned rec = committed ? RQ_COMMITTED : RQ_CANDIDATE;
    nir_ray_query_value value = nir_intrinsic_ray_query_value(intr);
 
    switch (value) {
@@ -460,32 +539,25 @@ lower_rq_load(nir_builder *b, struct lower_rq_ctx *ctx,
       break;
    }
 
-   if (value == nir_ray_query_value_intersection_type && !committed) {
-      nir_def *code = nir_ushr_imm(b, rq_load(b, rq, status), 29);
-      return nir_b2i32(b, nir_ieq_imm(b, code, RQ_STATUS_AABB));
+   if (value == nir_ray_query_value_intersection_type) {
+      if (committed)
+         return committed_type(b, rq, info);
+
+      return nir_b2i32(b, nir_ieq_imm(b, status_code(b, rq_load(b, rq, status)),
+                                      RQ_STATUS_AABB));
    }
 
    if (value == nir_ray_query_value_intersection_t && committed)
       return rq_load(b, rq, committed_t);
 
    nir_def *state = rq_state_addr(b, ctx, slot);
-   nir_def *kind = load_state(b, state, rec + RQ_REC_KIND, 1);
+   nir_def *kind = record_load(b, rq, info, state, committed, RQ_REC_KIND, 1);
 
    switch (value) {
-   case nir_ray_query_value_intersection_type: {
-      nir_def *code = nir_ushr_imm(b, kind, 29);
-      nir_def *record_type =
-         nir_bcsel(b, nir_ieq_imm(b, code, RQ_STATUS_GENERATED),
-                   nir_imm_int(b, 2),
-                   nir_b2i32(b, nir_uge_imm(b, code, RQ_STATUS_HIT)));
-      nir_def *type = rq_load(b, rq, committed_type);
-      return nir_bcsel(b, nir_ieq_imm(b, type, RQ_COMMITTED_FROM_RECORD),
-                       record_type, type);
-   }
    case nir_ray_query_value_intersection_t:
-      return load_state(b, state, rec + RQ_REC_T, 1);
+      return record_load(b, rq, info, state, committed, RQ_REC_T, 1);
    case nir_ray_query_value_intersection_barycentrics:
-      return load_state(b, state, rec + RQ_REC_BARY, 2);
+      return record_load(b, rq, info, state, committed, RQ_REC_BARY, 2);
    case nir_ray_query_value_intersection_front_face:
       return nir_i2b(b, nir_ubitfield_extract_imm(b, kind, 24, 1));
    default:
@@ -504,13 +576,17 @@ lower_rq_load(nir_builder *b, struct lower_rq_ctx *ctx,
       return nir_iand_imm(b, load_as(b, nir_iadd_imm(b, inst, offsetof(struct panvk_bvh_instance_leaf, flags_sbt_offset)), 1, 32), 0xffffff);
    }
    case nir_ray_query_value_intersection_primitive_index:
-      return primitive_leaf_word(b, as, kind, load_state(b, state, rec + RQ_REC_PRIM, 1), 13);
+      return primitive_leaf_word(b, as, kind, record_load(b, rq, info, state, committed, RQ_REC_PRIM, 1), 13);
    case nir_ray_query_value_intersection_geometry_index:
-      return nir_iand_imm(b, primitive_leaf_word(b, as, kind, load_state(b, state, rec + RQ_REC_PRIM, 1), 15), 0xffffff);
+      return nir_iand_imm(b, primitive_leaf_word(b, as, kind, record_load(b, rq, info, state, committed, RQ_REC_PRIM, 1), 15), 0xffffff);
+   case nir_ray_query_value_intersection_triangle_vertex_positions:
+      return panvk_nir_rt_triangle_vertex(b, as, kind,
+         record_load(b, rq, info, state, committed, RQ_REC_PRIM, 1),
+         nir_intrinsic_column(intr));
    case nir_ray_query_value_intersection_candidate_aabb_opaque: {
       nir_def *inst = instance_leaf(b, as, kind);
       nir_def *inst_flags = nir_ushr_imm(b, load_as(b, nir_iadd_imm(b, inst, offsetof(struct panvk_bvh_instance_leaf, flags_sbt_offset)), 1, 32), 24);
-      nir_def *leaf_flags = nir_ushr_imm(b, primitive_leaf_word(b, as, kind, load_state(b, state, rec + RQ_REC_PRIM, 1), 15), 24);
+      nir_def *leaf_flags = nir_ushr_imm(b, primitive_leaf_word(b, as, kind, record_load(b, rq, info, state, committed, RQ_REC_PRIM, 1), 15), 24);
       nir_def *ray_flags = rq_load(b, rq, flags);
       nir_def *opaque = nir_i2b(b, nir_iand_imm(b, leaf_flags, PANVK_BVH_LEAF_OPAQUE));
       opaque = nir_bcsel(b, nir_test_mask(b, inst_flags, VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR), nir_imm_true(b), opaque);
@@ -549,22 +625,246 @@ static void
 create_rq_var(nir_shader *nir, nir_function_impl *impl, nir_variable *var,
               struct lower_rq_ctx *ctx)
 {
-   struct rq_var *rq = ralloc(ctx->vars, struct rq_var);
+   struct rq_var *rq = rzalloc(ctx->vars, struct rq_var);
    const struct glsl_type *type = glsl_type_wrap_in_arrays(rq_type(), var->type);
 
    rq->var = impl ? nir_local_variable_create(impl, type, "ray_query")
                   : nir_variable_create(nir, nir_var_shader_temp, type, "ray_query");
-   rq->slot = ctx->slot_count;
-   ctx->slot_count += MAX2(glsl_get_aoa_size(var->type), 1);
+   rq->fast = true;
+   rq->resume = glsl_type_is_array(var->type);
 
    _mesa_hash_table_insert(ctx->vars, var, rq);
 }
 
-uint32_t
-panvk_per_arch(nir_lower_ray_queries)(nir_shader *nir)
+static bool
+def_is_proceed(nir_def *def, nir_def *proceed, bool *negated)
+{
+   *negated = false;
+   while (def != proceed) {
+      if (!nir_def_is_alu(def))
+         return false;
+
+      nir_alu_instr *alu = nir_def_as_alu(def);
+      if (alu->op == nir_op_inot)
+         *negated = !*negated;
+      else if (alu->op != nir_op_mov)
+         return false;
+
+      def = alu->src[0].src.ssa;
+   }
+
+   return true;
+}
+
+static bool
+cf_list_is_jump(struct exec_list *list, nir_jump_type type)
+{
+   if (!exec_list_is_singular(list))
+      return false;
+
+   nir_cf_node *node = exec_node_data(nir_cf_node, exec_list_get_head(list), node);
+   nir_block *block = nir_cf_node_as_block(node);
+
+   nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_jump ||
+          nir_instr_as_jump(instr)->type != type)
+         return false;
+   }
+
+   return type == nir_jump_continue || nir_block_ends_in_jump(block);
+}
+
+static bool
+proceed_in_empty_loop(nir_intrinsic_instr *proceed)
+{
+   nir_cf_node *parent = proceed->instr.block->cf_node.parent;
+   if (!parent || parent->type != nir_cf_node_loop)
+      return false;
+
+   nir_loop *loop = nir_cf_node_as_loop(parent);
+   if (nir_loop_has_continue_construct(loop))
+      return false;
+
+   bool exits = false;
+   foreach_list_typed(nir_cf_node, node, node, &loop->body) {
+      if (node->type == nir_cf_node_block) {
+         nir_foreach_instr(instr, nir_cf_node_as_block(node)) {
+            bool negated;
+            if (instr == &proceed->instr ||
+                instr->type == nir_instr_type_deref ||
+                instr->type == nir_instr_type_load_const)
+               continue;
+            if (instr->type == nir_instr_type_alu &&
+                def_is_proceed(&nir_instr_as_alu(instr)->def, &proceed->def,
+                               &negated))
+               continue;
+            if (instr->type == nir_instr_type_jump &&
+                nir_instr_as_jump(instr)->type == nir_jump_continue)
+               continue;
+            return false;
+         }
+      } else if (node->type == nir_cf_node_if) {
+         nir_if *nif = nir_cf_node_as_if(node);
+         bool negated;
+         if (!def_is_proceed(nif->condition.ssa, &proceed->def, &negated))
+            return false;
+
+         struct exec_list *exit = negated ? &nif->then_list : &nif->else_list;
+         struct exec_list *stay = negated ? &nif->else_list : &nif->then_list;
+         if (!cf_list_is_jump(exit, nir_jump_break) ||
+             !cf_list_is_jump(stay, nir_jump_continue))
+            return false;
+
+         exits = true;
+      } else {
+         return false;
+      }
+   }
+
+   return exits;
+}
+
+static int
+scan_rq_block(nir_block *block, nir_instr *after, nir_variable *var)
+{
+   bool active = !after;
+
+   nir_foreach_instr(instr, block) {
+      if (!active) {
+         active = instr == after;
+         continue;
+      }
+
+      if (instr->type != nir_instr_type_intrinsic)
+         continue;
+
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      if ((intr->intrinsic != nir_intrinsic_rq_initialize &&
+           intr->intrinsic != nir_intrinsic_rq_proceed) ||
+          nir_intrinsic_get_var(intr, 0) != var)
+         continue;
+
+      return intr->intrinsic == nir_intrinsic_rq_proceed ? 1 : -1;
+   }
+
+   return 0;
+}
+
+static bool
+proceed_reaches_proceed(nir_function_impl *impl, nir_intrinsic_instr *from)
+{
+   nir_variable *var = nir_intrinsic_get_var(from, 0);
+   int found = scan_rq_block(from->instr.block, &from->instr, var);
+   if (found)
+      return found > 0;
+
+   BITSET_WORD *visited = calloc(BITSET_WORDS(impl->num_blocks), sizeof(BITSET_WORD));
+   nir_block **stack = malloc(impl->num_blocks * sizeof(*stack));
+   unsigned top = 0;
+   bool reached = false;
+   nir_block *block = from->instr.block;
+
+   while (block) {
+      for (unsigned s = 0; s < 2; s++) {
+         nir_block *succ = block->successors[s];
+         if (succ && !BITSET_TEST(visited, succ->index)) {
+            BITSET_SET(visited, succ->index);
+            stack[top++] = succ;
+         }
+      }
+
+      block = NULL;
+      while (top && !block && !reached) {
+         nir_block *next = stack[--top];
+         found = scan_rq_block(next, NULL, var);
+         if (found > 0)
+            reached = true;
+         else if (!found)
+            block = next;
+      }
+   }
+
+   free(visited);
+   free(stack);
+   return reached;
+}
+
+static bool
+flags_exclude_candidates(nir_src flags)
+{
+   if (!nir_src_is_const(flags))
+      return false;
+
+   uint32_t value = nir_src_as_uint(flags);
+   return (value & (SpvRayFlagsOpaqueKHRMask | SpvRayFlagsCullNoOpaqueKHRMask |
+                    SpvRayFlagsSkipTrianglesKHRMask)) &&
+          (value & SpvRayFlagsSkipAABBsKHRMask);
+}
+
+static void
+analyze_rq(nir_function_impl *impl, struct lower_rq_ctx *ctx)
+{
+   nir_metadata_require(impl, nir_metadata_block_index);
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type != nir_instr_type_intrinsic)
+            continue;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+         if (!nir_intrinsic_is_ray_query(intr->intrinsic))
+            continue;
+
+         struct rq_var *rq = rq_var_get(ctx, intr);
+         switch (intr->intrinsic) {
+         case nir_intrinsic_rq_initialize:
+            if (!flags_exclude_candidates(intr->src[2]))
+               rq->candidates = true;
+            break;
+         case nir_intrinsic_rq_proceed:
+            rq->has_proceed = true;
+            if (!proceed_in_empty_loop(intr))
+               rq->fast = false;
+            if (proceed_reaches_proceed(impl, intr))
+               rq->resume = true;
+            break;
+         case nir_intrinsic_rq_confirm_intersection:
+         case nir_intrinsic_rq_generate_intersection:
+            rq->fast = false;
+            rq->records = true;
+            break;
+         case nir_intrinsic_rq_terminate:
+            rq->fast = false;
+            break;
+         case nir_intrinsic_rq_load: {
+            nir_ray_query_value value = nir_intrinsic_ray_query_value(intr);
+            bool committed = nir_intrinsic_committed(intr);
+            if (value == nir_ray_query_value_tmin ||
+                value == nir_ray_query_value_flags ||
+                value == nir_ray_query_value_world_ray_origin ||
+                value == nir_ray_query_value_world_ray_direction)
+               break;
+            if (!committed)
+               rq->fast = false;
+            if (value != nir_ray_query_value_intersection_type &&
+                (value != nir_ray_query_value_intersection_t || !committed))
+               rq->records = true;
+            break;
+         }
+         default:
+            UNREACHABLE("Unsupported ray query intrinsic");
+         }
+      }
+   }
+}
+
+static uint32_t
+lower_ray_queries(nir_shader *nir, uint32_t slot_base, uint32_t frame_offset)
 {
    struct lower_rq_ctx ctx = {
       .vars = _mesa_pointer_hash_table_create(NULL),
+      .slot_count = slot_base,
+      .frame_offset = frame_offset,
    };
 
    nir_foreach_variable_in_shader(var, nir) {
@@ -579,9 +879,32 @@ panvk_per_arch(nir_lower_ray_queries)(nir_shader *nir)
       }
    }
 
-   if (!ctx.slot_count) {
+   if (!ctx.vars->entries) {
       ralloc_free(ctx.vars);
-      return 0;
+      return slot_base;
+   }
+
+   nir_foreach_function_impl(impl, nir)
+      analyze_rq(impl, &ctx);
+
+   hash_table_foreach(ctx.vars, entry) {
+      struct rq_var *rq = entry->data;
+      const nir_variable *var = entry->key;
+
+      rq->fast &= rq->has_proceed;
+      if (rq->fast)
+         rq->candidates = false;
+      if (!rq->candidates)
+         rq->resume = false;
+      if (rq->resume) {
+         const char *variant = getenv("PANVK_RQ_VARIANT");
+         rq->eager = variant ? atoi(variant) : 0;
+      }
+
+      if (rq->records || rq->resume) {
+         rq->slot = ctx.slot_count;
+         ctx.slot_count += MAX2(glsl_get_aoa_size(var->type), 1);
+      }
    }
 
    nir_foreach_function_impl(impl, nir) {
@@ -604,27 +927,28 @@ panvk_per_arch(nir_lower_ray_queries)(nir_shader *nir)
             if (!nir_intrinsic_is_ray_query(intr->intrinsic))
                continue;
 
+            const struct rq_var *info = rq_var_get(&ctx, intr);
             b.cursor = nir_before_instr(instr);
 
             nir_def *def = NULL;
             switch (intr->intrinsic) {
             case nir_intrinsic_rq_initialize:
-               lower_rq_initialize(&b, &ctx, intr);
+               lower_rq_initialize(&b, &ctx, info, intr);
                break;
             case nir_intrinsic_rq_proceed:
-               def = lower_rq_proceed(&b, &ctx, intr);
+               def = lower_rq_proceed(&b, &ctx, info, intr);
                break;
             case nir_intrinsic_rq_confirm_intersection:
-               lower_rq_confirm_intersection(&b, &ctx, intr);
+               lower_rq_commit(&b, &ctx, info, intr, false);
                break;
             case nir_intrinsic_rq_generate_intersection:
-               lower_rq_generate_intersection(&b, &ctx, intr);
+               lower_rq_commit(&b, &ctx, info, intr, true);
                break;
             case nir_intrinsic_rq_terminate:
                lower_rq_terminate(&b, &ctx, intr);
                break;
             case nir_intrinsic_rq_load:
-               def = lower_rq_load(&b, &ctx, intr);
+               def = lower_rq_load(&b, &ctx, info, intr);
                break;
             default:
                UNREACHABLE("Unsupported ray query intrinsic");
@@ -642,4 +966,17 @@ panvk_per_arch(nir_lower_ray_queries)(nir_shader *nir)
 
    ralloc_free(ctx.vars);
    return ctx.slot_count;
+}
+
+uint32_t
+panvk_per_arch(nir_lower_ray_queries)(nir_shader *nir, uint32_t slot_base)
+{
+   return lower_ray_queries(nir, slot_base, 0);
+}
+
+uint32_t
+panvk_per_arch(nir_lower_rt_ray_queries)(nir_shader *nir, uint32_t frame_offset)
+{
+   assert(frame_offset && frame_offset % PANVK_RAY_QUERY_STATE_SIZE == 0);
+   return lower_ray_queries(nir, 0, frame_offset);
 }

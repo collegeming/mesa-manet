@@ -10,6 +10,8 @@
 #include "compiler/nir/nir_builder.h"
 #include "panfrost/compiler/pan_compiler.h"
 #include "panfrost/compiler/pan_nir.h"
+#include "util/half_float.h"
+#include "util/hash_table.h"
 #include "util/perf/cpu_trace.h"
 #include "util/u_string.h"
 
@@ -116,6 +118,29 @@ bi_lower_bit_size(const nir_instr *instr, void *data)
  * (8-bit in Bifrost, 32-bit in NIR TODO - workaround!). Some conversions need
  * to be scalarized due to type size. */
 
+static bool
+bi_has_foldable_float_const(const nir_alu_instr *alu)
+{
+   if (alu->op != nir_op_fmul && alu->op != nir_op_ffma &&
+       alu->op != nir_op_fadd)
+      return false;
+
+   unsigned mul_srcs = alu->op == nir_op_fadd ? 0 : 2;
+   unsigned num_srcs = nir_op_infos[alu->op].num_inputs;
+   for (unsigned s = 0; s < num_srcs; s++) {
+      if (!nir_src_is_const(alu->src[s].src))
+         continue;
+
+      for (unsigned c = 0; c < alu->def.num_components; c++) {
+         double v = nir_src_comp_as_float(alu->src[s].src, alu->src[s].swizzle[c]);
+         if (v == 0.0 || (s < mul_srcs && fabs(v) == 1.0))
+            return true;
+      }
+   }
+
+   return false;
+}
+
 static uint8_t
 bi_vectorize_filter(const nir_instr *instr, const void *data)
 {
@@ -170,6 +195,7 @@ bi_vectorize_filter(const nir_instr *instr, const void *data)
    case nir_op_fpow:
    case nir_op_frcp:
    case nir_op_frsq:
+   case nir_op_fsqrt:
    case nir_op_ishl:
    case nir_op_ishr:
    case nir_op_ushr:
@@ -202,8 +228,11 @@ bi_vectorize_filter(const nir_instr *instr, const void *data)
 
    if (bit_size == 1)
       return 0;
-   else
-      return MAX2(1, 32 / bit_size);
+
+   if (bit_size == 16 && bi_has_foldable_float_const(alu))
+      return 1;
+
+   return MAX2(1, 32 / bit_size);
 }
 
 static bool
@@ -275,6 +304,40 @@ bi_keep_uniform_branches(nir_shader *nir)
    }
 }
 
+static bool
+bi_undef_needs_zero(nir_undef_instr *undef)
+{
+   nir_foreach_use_including_if(use, &undef->def) {
+      if (nir_src_is_if(use))
+         return true;
+
+      nir_instr *vec_instr = nir_src_use_instr(use);
+      if (vec_instr->type != nir_instr_type_alu ||
+          !nir_op_is_vec(nir_instr_as_alu(vec_instr)->op))
+         return true;
+
+      nir_foreach_use_including_if(vec_use, &nir_instr_as_alu(vec_instr)->def) {
+         if (nir_src_is_if(vec_use))
+            return true;
+
+         nir_instr *user = nir_src_use_instr(vec_use);
+         if (user->type != nir_instr_type_intrinsic)
+            return true;
+
+         nir_intrinsic_instr *intr = nir_instr_as_intrinsic(user);
+         bool color = vec_use == &intr->src[2] ||
+                      (intr->intrinsic == nir_intrinsic_blend2_pan &&
+                       vec_use == &intr->src[3]);
+         if ((intr->intrinsic != nir_intrinsic_blend_pan &&
+              intr->intrinsic != nir_intrinsic_blend2_pan) ||
+             !color)
+            return true;
+      }
+   }
+
+   return false;
+}
+
 static void
 bi_optimize_loop(nir_shader *nir, uint64_t gpu_id, bool allow_copies)
 {
@@ -312,13 +375,17 @@ bi_optimize_loop(nir_shader *nir, uint64_t gpu_id, bool allow_copies)
          .limit = 64,
          .expensive_alu_ok = true,
          .discard_ok = pan_arch(gpu_id) >= 9,
+         .collapse_limit =
+            bi_use_kraid(nir, gpu_id) && pan_arch(gpu_id) >= 15 ? 1 : 0,
       };
       bi_keep_uniform_branches(nir);
       NIR_PASS(progress, nir, nir_opt_peephole_select,
                &peephole_select_options);
       NIR_PASS(progress, nir, nir_opt_idiv_const, 8);
-      if (bi_use_kraid(nir, gpu_id))
+      if (bi_use_kraid(nir, gpu_id)) {
+         NIR_PASS(progress, nir, pan_nir_opt_phi_alu);
          NIR_PASS(progress, nir, bifrost_nir_opt_fp16, true);
+      }
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
 
@@ -351,7 +418,8 @@ bi_optimize_loop(nir_shader *nir, uint64_t gpu_id, bool allow_copies)
       NIR_PASS(progress, nir, nir_opt_undef);
    } while (progress);
 
-   NIR_PASS(_, nir, nir_lower_undef_to_zero, NULL);
+   NIR_PASS(_, nir, nir_lower_undef_to_zero,
+            bi_use_kraid(nir, gpu_id) ? bi_undef_needs_zero : NULL);
 
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
 
@@ -361,6 +429,9 @@ bi_optimize_loop(nir_shader *nir, uint64_t gpu_id, bool allow_copies)
     */
    if (pan_arch(gpu_id) >= 9 && nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, nir_opt_move_discards_to_top);
+
+   if (pan_arch(gpu_id) >= 15 && nir->info.stage == MESA_SHADER_FRAGMENT)
+      NIR_PASS(_, nir, pan_nir_move_atest_after_discards);
 }
 
 #define BI_RSCALE_BLOCKERS                                                    \
@@ -392,6 +463,15 @@ bi_scalar_is_fmul(nir_scalar s)
 {
    s = nir_scalar_chase_movs(s);
    return nir_scalar_is_alu(s) && nir_scalar_alu_op(s) == nir_op_fmul;
+}
+
+static bool
+bi_scalar_is_widened_half(nir_scalar s)
+{
+   s = nir_scalar_chase_movs(s);
+   if (!nir_scalar_is_alu(s) || nir_scalar_alu_op(s) != nir_op_f2f32)
+      return false;
+   return nir_scalar_chase_alu_src(s, 0).def->bit_size == 16;
 }
 
 static bool
@@ -430,7 +510,7 @@ bi_rscale_scalar_ok(const nir_alu_instr *alu)
 }
 
 static bool
-bi_fau_pressure(nir_shader *nir)
+bi_fau_pressure(nir_shader *nir, unsigned max_push)
 {
    struct hash_table_u64 *words = _mesa_hash_table_u64_create(NULL);
    nir_foreach_function_impl(impl, nir) {
@@ -453,7 +533,7 @@ bi_fau_pressure(nir_shader *nir)
    }
    unsigned count = _mesa_hash_table_u64_num_entries(words);
    _mesa_hash_table_u64_destroy(words);
-   return count * 4 > PAN_MAX_PUSH * 3;
+   return count * 4 > max_push * 3;
 }
 
 static bool
@@ -492,6 +572,8 @@ bi_fuse_rscale(nir_builder *b, nir_alu_instr *mul, void *data)
       nir_scalar p0 = nir_scalar_chase_alu_src(ps, 0);
       nir_scalar p1 = nir_scalar_chase_alu_src(ps, 1);
       if (prod->op == nir_op_fadd && (bi_scalar_is_fmul(p0) || bi_scalar_is_fmul(p1)))
+         continue;
+      if (bi_scalar_is_widened_half(p0) || bi_scalar_is_widened_half(p1))
          continue;
 
       b->cursor = nir_before_instr(&mul->instr);
@@ -533,7 +615,8 @@ bi_fuse_rscale(nir_builder *b, nir_alu_instr *mul, void *data)
             continue;
 
          nir_scalar a = nir_scalar_chase_alu_src(y, 1 - t);
-         if (nir_scalar_is_const(a))
+         if (nir_scalar_is_const(a) || bi_scalar_is_widened_half(a) ||
+             bi_scalar_is_widened_half(z))
             continue;
 
          negate ^= outer_neg;
@@ -551,17 +634,66 @@ bi_fuse_rscale(nir_builder *b, nir_alu_instr *mul, void *data)
    return false;
 }
 
-static void
-bi_optimize_late(nir_shader *nir, uint64_t gpu_id,
-                const struct pan_shader_info *info)
+static bool
+bi_fuse_shift_add(nir_builder *b, nir_alu_instr *alu, void *data)
 {
-   NIR_PASS(_, nir, nir_opt_shrink_stores, false /* shrink_image_store */);
-   bi_optimize_loop(nir, gpu_id, false /* allow_copies */);
+   struct hash_table *range_ht = data;
 
-   NIR_PASS(_, nir, nir_opt_shrink_vectors, false);
+   if (alu->op != nir_op_iadd || alu->def.num_components != 1 ||
+       alu->def.bit_size != 32)
+      return false;
 
-   NIR_PASS(_, nir, pan_nir_fuse_io_cvt, gpu_id, &info->varyings.formats);
+   nir_scalar add = nir_get_scalar(&alu->def, 0);
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar shl = nir_scalar_chase_alu_src(add, i);
+      if (!nir_scalar_is_alu(shl) ||
+          nir_scalar_alu_op(shl) != nir_op_lshift_or_pan ||
+          !list_is_singular(&shl.def->uses))
+         continue;
 
+      nir_scalar shift = nir_scalar_chase_alu_src(shl, 1);
+      nir_scalar orv = nir_scalar_chase_alu_src(shl, 2);
+      if (!nir_scalar_is_const(shift) || !nir_scalar_is_const(orv) ||
+          nir_scalar_as_uint(orv) != 0)
+         continue;
+
+      unsigned s = nir_scalar_as_uint(shift) & 31;
+      if (s == 0)
+         continue;
+
+      nir_scalar other = nir_scalar_chase_alu_src(add, 1 - i);
+      if (nir_scalar_is_const(other))
+         continue;
+      if (nir_unsigned_upper_bound(b->shader, range_ht, other) >= (1u << s))
+         continue;
+
+      b->cursor = nir_before_instr(&alu->instr);
+      nir_def *src = nir_scalar_chase_alu_src(shl, 0).def;
+      nir_scalar src_s = nir_scalar_chase_alu_src(shl, 0);
+      nir_def *res = nir_lshift_or_pan(b, nir_channel(b, src, src_s.comp),
+                                      nir_imm_intN_t(b, s, 8),
+                                      nir_channel(b, other.def, other.comp));
+      nir_def_replace(&alu->def, res);
+      _mesa_hash_table_clear(range_ht, NULL);
+      return true;
+   }
+
+   return false;
+}
+
+static bool
+bi_opt_fuse_shift_add(nir_shader *nir)
+{
+   struct hash_table *range_ht = _mesa_pointer_hash_table_create(NULL);
+   bool progress = nir_shader_alu_pass(nir, bi_fuse_shift_add,
+                                       nir_metadata_control_flow, range_ht);
+   _mesa_hash_table_destroy(range_ht, NULL);
+   return progress;
+}
+
+static void
+bi_optimize_late_alu(nir_shader *nir, uint64_t gpu_id, bool reassoc)
+{
    /* nir_lower_pack can generate split operations, execute algebraic again to
     * handle them */
    bool algebraic_progress = true;
@@ -575,6 +707,7 @@ bi_optimize_late(nir_shader *nir, uint64_t gpu_id,
     * not supported either we lower that too.
     * TODO: wire up isub64 and ineg64, then remove this
     */
+   NIR_PASS(_, nir, pan_nir_opt_shadd, pan_arch(gpu_id));
    NIR_PASS(_, nir, nir_lower_int64);
 
    /* Algebraic can materialize instructions with a bit_size that we need to lower */
@@ -587,6 +720,11 @@ bi_optimize_late(nir_shader *nir, uint64_t gpu_id,
    /* We need to cleanup after each iteration of late algebraic
     * optimizations, since otherwise NIR can produce weird edge cases
     * (like fneg of a constant) which we don't handle */
+   if (reassoc) {
+      nir_opt_reassociate_loop(
+         nir, nir_reassociate_scalar_math | nir_reassociate_cse_heuristic);
+   }
+
    if (bi_use_kraid(nir, gpu_id) &&
        (nir->info.stage != MESA_SHADER_VERTEX ||
         nir->info.next_stage == MESA_SHADER_FRAGMENT))
@@ -621,6 +759,8 @@ bi_optimize_late(nir_shader *nir, uint64_t gpu_id,
       late_algebraic_progress = false;
       NIR_PASS(late_algebraic_progress, nir, bifrost_nir_lower_algebraic_late,
                pan_arch(gpu_id), bi_use_kraid(nir, gpu_id));
+      if (bi_use_kraid(nir, gpu_id))
+         NIR_PASS(late_algebraic_progress, nir, bi_opt_fuse_shift_add);
       late_algebraic |= late_algebraic_progress;
    }
 
@@ -633,10 +773,47 @@ bi_optimize_late(nir_shader *nir, uint64_t gpu_id,
       NIR_PASS(_, nir, nir_opt_dce);
       NIR_PASS(_, nir, nir_opt_cse);
    }
+}
 
+static void
+bi_optimize_late(nir_shader *nir, uint64_t gpu_id,
+                 const struct pan_shader_info *info, bool reassoc)
+{
+   NIR_PASS(_, nir, nir_opt_shrink_stores, false /* shrink_image_store */);
+   bi_optimize_loop(nir, gpu_id, false /* allow_copies */);
+
+   if (bi_use_kraid(nir, gpu_id) && pan_arch(gpu_id) >= 15) {
+      bool rotated = false;
+      NIR_PASS(rotated, nir, nir_opt_loop_rotate);
+      if (rotated)
+         bi_optimize_loop(nir, gpu_id, false);
+   }
+
+   NIR_PASS(_, nir, nir_opt_shrink_vectors, false);
+
+   NIR_PASS(_, nir, pan_nir_fuse_io_cvt, gpu_id, &info->varyings.formats);
+
+   bi_optimize_late_alu(nir, gpu_id, reassoc);
+}
+
+static void
+bi_opt_late_uniform_reassoc(nir_shader *nir)
+{
+   bool reassoc = false;
+   NIR_PASS(reassoc, nir, bifrost_nir_opt_uniform_reassoc);
+   if (reassoc) {
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_cse);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+}
+
+static void
+bi_optimize_late_finish(nir_shader *nir, uint64_t gpu_id, uint32_t gpu_variant)
+{
    if (bi_use_kraid(nir, gpu_id)) {
       bool rscale = false;
-      bool pressure = bi_fau_pressure(nir);
+      bool pressure = bi_fau_pressure(nir, pan_max_push(gpu_id, gpu_variant));
       NIR_PASS(rscale, nir, nir_shader_alu_pass, bi_fuse_rscale,
                nir_metadata_control_flow, &pressure);
       if (rscale)
@@ -664,6 +841,17 @@ bi_optimize_late(nir_shader *nir, uint64_t gpu_id,
    }
 }
 
+static bool
+bi_lower_subgroup_size(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_subgroup_size)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def_replace(&intr->def, nir_imm_int(b, *(const unsigned *)data));
+   return true;
+}
+
 void
 bifrost_preprocess_nir(nir_shader *nir, uint64_t gpu_id)
 {
@@ -671,6 +859,12 @@ bifrost_preprocess_nir(nir_shader *nir, uint64_t gpu_id)
 
    NIR_PASS(_, nir, pan_nir_lower_bf16);
    NIR_PASS(_, nir, nir_split_var_copies);
+
+   if (bi_use_kraid(nir, gpu_id)) {
+      unsigned subgroup_size = pan_subgroup_size(pan_arch(gpu_id));
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, bi_lower_subgroup_size,
+               nir_metadata_control_flow, &subgroup_size);
+   }
 
    /* The DISCARD instruction just flags the thread as discarded, but the
     * actual termination only happens when all threads in the quad are
@@ -859,6 +1053,58 @@ bi_lower_subgroups_filter(const nir_intrinsic_instr *intr,
    default:
       return true;
    }
+}
+
+static bool
+bi_opt_relative_shuffle(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_shuffle ||
+       intr->def.num_components != 1)
+      return false;
+
+   nir_scalar idx = nir_get_scalar(intr->src[1].ssa, 0);
+   if (!nir_scalar_is_alu(idx))
+      return false;
+
+   nir_op op = nir_scalar_alu_op(idx);
+   if (op != nir_op_iadd && op != nir_op_isub && op != nir_op_ixor)
+      return false;
+
+   nir_scalar lane = nir_scalar_chase_alu_src(idx, 0);
+   nir_scalar offset = nir_scalar_chase_alu_src(idx, 1);
+   if (op != nir_op_isub && nir_scalar_is_const(lane)) {
+      nir_scalar tmp = lane;
+      lane = offset;
+      offset = tmp;
+   }
+
+   if (!nir_scalar_is_intrinsic(lane) ||
+       nir_scalar_intrinsic_op(lane) != nir_intrinsic_load_subgroup_invocation ||
+       !nir_scalar_is_const(offset))
+      return false;
+
+   int64_t delta = nir_scalar_as_int(offset);
+   unsigned subgroup_size = *(const unsigned *)data;
+   nir_def *value = intr->src[0].ssa;
+   nir_def *res;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   if (op == nir_op_ixor) {
+      if (delta <= 0 || delta >= subgroup_size)
+         return false;
+      res = nir_shuffle_xor(b, value, nir_imm_int(b, delta));
+   } else {
+      if (op == nir_op_isub)
+         delta = -delta;
+      if (delta == 0 || delta <= -(int64_t)subgroup_size ||
+          delta >= subgroup_size)
+         return false;
+      res = delta < 0 ? nir_shuffle_up(b, value, nir_imm_int(b, -delta))
+                      : nir_shuffle_down(b, value, nir_imm_int(b, delta));
+   }
+
+   nir_def_replace(&intr->def, res);
+   return true;
 }
 
 static bool
@@ -1237,6 +1483,198 @@ static bool pan_nir_lower_buf_image_access(nir_shader *nir, unsigned arch);
 static bool bi_should_idvs(nir_shader *nir, const struct pan_compile_inputs *inputs);
 static bool bifrost_nir_lower_vs_atomics(nir_shader *nir);
 
+struct bi_txf_quad_candidate {
+   nir_tex_instr *tex;
+   nir_def *handle;
+   nir_scalar base[2];
+   unsigned off[2];
+};
+
+static bool
+bi_get_txf_quad_candidate(nir_tex_instr *tex,
+                          struct bi_txf_quad_candidate *c)
+{
+   if (tex->op != nir_texop_txf || tex->sampler_dim != GLSL_SAMPLER_DIM_2D ||
+       tex->is_array || tex->is_sparse || tex->is_shadow || tex->num_srcs != 2)
+      return false;
+
+   int h = nir_tex_instr_src_index(tex, nir_tex_src_texture_handle);
+   int s = nir_tex_instr_src_index(tex, nir_tex_src_backend1);
+   if (h < 0 || s < 0)
+      return false;
+
+   struct pan_va_tex_flags flags;
+   memcpy(&flags, &tex->backend_flags, sizeof(flags));
+   if (flags.texel_offset || flags.array_enable || flags.compare_enable ||
+       flags.projection_enable || flags.wide_indices)
+      return false;
+
+   nir_def *handle = tex->src[h].src.ssa;
+   nir_def *coord = tex->src[s].src.ssa;
+   if (handle->num_components != 2 || coord->num_components != 2 ||
+       coord->bit_size != 32)
+      return false;
+
+   nir_scalar narrow = nir_scalar_resolved(handle, 1);
+   if (!nir_scalar_is_const(narrow) || nir_scalar_as_uint(narrow) != 0)
+      return false;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar v = nir_scalar_resolved(coord, i);
+      unsigned off = 0;
+      if (nir_scalar_is_alu(v) && nir_scalar_alu_op(v) == nir_op_iadd) {
+         for (unsigned k = 0; k < 2; k++) {
+            nir_scalar imm = nir_scalar_chase_alu_src(v, k);
+            if (nir_scalar_is_const(imm) && nir_scalar_as_uint(imm) == 1) {
+               v = nir_scalar_chase_alu_src(v, 1 - k);
+               off = 1;
+               break;
+            }
+         }
+      }
+      c->base[i] = v;
+      c->off[i] = off;
+   }
+
+   c->tex = tex;
+   c->handle = handle;
+   return true;
+}
+
+static bool
+bi_same_tex_handle(nir_def *a, nir_def *b)
+{
+   if (a == b)
+      return true;
+
+   for (unsigned i = 0; i < 2; i++) {
+      nir_scalar x = nir_scalar_resolved(a, i);
+      nir_scalar y = nir_scalar_resolved(b, i);
+      if (nir_scalar_is_const(x) && nir_scalar_is_const(y)) {
+         if (nir_scalar_as_uint(x) != nir_scalar_as_uint(y))
+            return false;
+      } else if (!nir_scalar_equal(x, y)) {
+         return false;
+      }
+   }
+
+   return true;
+}
+
+static bool
+bi_same_txf_quad(const struct bi_txf_quad_candidate *a,
+                 const struct bi_txf_quad_candidate *b)
+{
+   return bi_same_tex_handle(a->handle, b->handle) &&
+          a->tex->dest_type == b->tex->dest_type &&
+          a->tex->def.bit_size == b->tex->def.bit_size &&
+          a->tex->backend_flags == b->tex->backend_flags &&
+          nir_scalar_equal(a->base[0], b->base[0]) &&
+          nir_scalar_equal(a->base[1], b->base[1]);
+}
+
+static bool
+bi_fuse_txf_quads_block(nir_builder *b, nir_block *block)
+{
+   struct bi_txf_quad_candidate cands[64];
+   bool fused[64] = {false};
+   unsigned count = 0;
+
+   nir_foreach_instr(instr, block) {
+      if (instr->type == nir_instr_type_tex && count < ARRAY_SIZE(cands) &&
+          bi_get_txf_quad_candidate(nir_instr_as_tex(instr), &cands[count]))
+         count++;
+   }
+
+   bool progress = false;
+   for (unsigned i = 0; i < count; i++) {
+      if (fused[i])
+         continue;
+
+      int quad[4] = {-1, -1, -1, -1};
+      for (unsigned j = i; j < count; j++) {
+         if (fused[j] || !bi_same_txf_quad(&cands[i], &cands[j]))
+            continue;
+         unsigned slot = cands[j].off[0] + 2 * cands[j].off[1];
+         if (quad[slot] < 0)
+            quad[slot] = j;
+      }
+
+      if (quad[0] < 0 || quad[1] < 0 || quad[2] < 0 || quad[3] < 0)
+         continue;
+
+      nir_component_mask_t read = 0;
+      for (unsigned k = 0; k < 4; k++)
+         read |= nir_def_components_read(&cands[quad[k]].tex->def);
+      if (!read || util_bitcount(read) > 3)
+         continue;
+
+      unsigned first = MIN2(MIN2(quad[0], quad[1]), MIN2(quad[2], quad[3]));
+      const struct bi_txf_quad_candidate *ref = &cands[first];
+      b->cursor = nir_before_instr(&ref->tex->instr);
+
+      nir_scalar base[2] = {ref->base[0], ref->base[1]};
+      nir_def *coord = nir_vec_scalars(b, base, 2);
+
+      struct pan_va_tex_flags flags;
+      memcpy(&flags, &ref->tex->backend_flags, sizeof(flags));
+      flags.integer_coordinates = true;
+
+      nir_def *gathers[4] = {NULL};
+      u_foreach_bit(c, read) {
+         nir_tex_instr *g = nir_tex_instr_create(b->shader, 2);
+         g->op = nir_texop_tg4;
+         g->sampler_dim = GLSL_SAMPLER_DIM_2D;
+         g->dest_type = ref->tex->dest_type;
+         g->coord_components = ref->tex->coord_components;
+         g->texture_index = ref->tex->texture_index;
+         g->sampler_index = ref->tex->sampler_index;
+         g->component = c;
+         g->backend_flags = PAN_AS_U32(flags);
+         g->src[0] =
+            nir_tex_src_for_ssa(nir_tex_src_texture_handle, ref->handle);
+         g->src[1] = nir_tex_src_for_ssa(nir_tex_src_backend1, coord);
+         nir_def_init(&g->instr, &g->def, 4, ref->tex->def.bit_size);
+         nir_builder_instr_insert(b, &g->instr);
+         gathers[c] = &g->def;
+      }
+
+      static const unsigned lane[4] = {3, 2, 0, 1};
+      for (unsigned k = 0; k < 4; k++) {
+         nir_tex_instr *t = cands[quad[k]].tex;
+         nir_def *undef = nir_undef(b, 1, t->def.bit_size);
+         nir_scalar comps[NIR_MAX_VEC_COMPONENTS];
+         for (unsigned c = 0; c < t->def.num_components; c++) {
+            comps[c] = gathers[c] ? nir_get_scalar(gathers[c], lane[k])
+                                  : nir_get_scalar(undef, 0);
+         }
+         nir_def *v = nir_vec_scalars(b, comps, t->def.num_components);
+         nir_def_rewrite_uses(&t->def, v);
+         nir_instr_remove(&t->instr);
+         fused[quad[k]] = true;
+      }
+      progress = true;
+   }
+
+   return progress;
+}
+
+static bool
+bi_fuse_txf_quads(nir_shader *nir)
+{
+   bool progress = false;
+
+   nir_foreach_function_impl(impl, nir) {
+      nir_builder b = nir_builder_create(impl);
+      bool impl_progress = false;
+      nir_foreach_block(block, impl)
+         impl_progress |= bi_fuse_txf_quads_block(&b, block);
+      progress |= nir_progress(impl_progress, impl, nir_metadata_control_flow);
+   }
+
+   return progress;
+}
+
 void
 bifrost_postprocess_nir(nir_shader *nir,
                         const struct pan_compile_inputs *inputs,
@@ -1296,9 +1734,10 @@ bifrost_postprocess_nir(nir_shader *nir,
                                       BITFIELD_BIT(FRAG_RESULT_STENCIL));
       const bool skip_atest = inputs->is_blit && !emit_zs;
       NIR_PASS(_, nir, pan_nir_lower_fs_outputs, skip_atest,
-               inputs->fragcolor_nr_cbufs);
+               inputs->fragcolor_nr_cbufs, 0, false);
    } else if (nir->info.stage == MESA_SHADER_VERTEX) {
-      NIR_PASS(_, nir, nir_lower_viewport_transform);
+      if (!inputs->screen_space_position)
+         NIR_PASS(_, nir, pan_nir_lower_viewport_transform);
       NIR_PASS(_, nir, nir_lower_point_size, 1.0, 0.0);
 
       /* Copy varying format & Layout */
@@ -1324,6 +1763,8 @@ bifrost_postprocess_nir(nir_shader *nir,
    }
 
    NIR_PASS(_, nir, pan_nir_lower_tex, gpu_id);
+   if (bi_use_kraid(nir, gpu_id))
+      NIR_PASS(_, nir, bi_fuse_txf_quads);
    NIR_PASS(_, nir, pan_nir_lower_image, gpu_id,
             inputs->image_access_in_bounds);
    NIR_PASS(_, nir, pan_nir_lower_tensor);
@@ -1470,8 +1911,12 @@ bifrost_postprocess_nir(nir_shader *nir,
       .lower_boolean_reduce = true,
       .lower_boolean_shuffle = true,
    };
-   if (bi_use_kraid(nir, gpu_id))
+   if (bi_use_kraid(nir, gpu_id)) {
+      unsigned subgroup_size = pan_subgroup_size(gpu_arch);
+      NIR_PASS(_, nir, nir_shader_intrinsics_pass, bi_opt_relative_shuffle,
+               nir_metadata_control_flow, &subgroup_size);
       nir_divergence_analysis(nir);
+   }
    bool lower_subgroups_progress = false;
    NIR_PASS(lower_subgroups_progress, nir, nir_lower_subgroups,
             &lower_subgroup_opts);
@@ -1498,6 +1943,7 @@ bifrost_postprocess_nir(nir_shader *nir,
 
    /* Lower 64-bit integers */
    NIR_PASS(_, nir, nir_lower_64bit_phis);
+   NIR_PASS(_, nir, pan_nir_opt_shadd, pan_arch(gpu_id));
    NIR_PASS(_, nir, nir_lower_int64);
 
    const nir_lower_idiv_options lower_idiv_opts = {
@@ -1730,7 +2176,7 @@ bifrost_make_unified_idvs_shader(nir_shader *nir)
    b->cursor = nir_before_impl(impl);
    nir_def *shader_output = nir_load_shader_output_pan(b);
 
-   nir_block *out_blocks[VA_SHADER_OUTPUT_COUNT] = {NULL};
+   nir_if *out_ifs[VA_SHADER_OUTPUT_COUNT] = {NULL};
 
    for (enum va_shader_output out = 0; out < VA_SHADER_OUTPUT_COUNT; ++out) {
       nir_def *cond =
@@ -1740,7 +2186,7 @@ bifrost_make_unified_idvs_shader(nir_shader *nir)
                                      NULL);
       nir_pop_if(b, NULL);
 
-      out_blocks[out] = nir_if_first_then_block(nif);
+      out_ifs[out] = nif;
    }
 
    /* After messing around with the CFG, reindex blocks. */
@@ -1751,10 +2197,10 @@ bifrost_make_unified_idvs_shader(nir_shader *nir)
     * instruction is in.
     */
    for (enum va_shader_output out = 0; out < VA_SHADER_OUTPUT_COUNT; ++out) {
-      nir_block *out_block = out_blocks[out];
-      assert(out_block);
+      nir_if *out_if = out_ifs[out];
+      assert(out_if);
 
-      nir_foreach_block_in_cf_node_safe(block, &out_block->cf_node) {
+      nir_foreach_block_in_cf_node_safe(block, &out_if->cf_node) {
          nir_foreach_instr_safe(instr, block) {
             if (instr->type != nir_instr_type_intrinsic)
                continue;
@@ -1865,6 +2311,15 @@ bifrost_dump_shader(nir_shader *nir, struct util_dynarray *binary,
    free(path);
 }
 
+static bool
+kraid_reads_rasterizer_coverage(nir_builder *b, nir_intrinsic_instr *intrin,
+                                void *data)
+{
+   if (intrin->intrinsic == nir_intrinsic_load_sample_mask_in)
+      *(bool *)data = true;
+   return false;
+}
+
 static void
 kraid_compile_variant(nir_shader *nir,
                       const struct pan_compile_inputs *inputs,
@@ -1913,6 +2368,13 @@ kraid_compile_variant(nir_shader *nir,
 #ifdef WITH_PANFROST_RUST
       nir_index_blocks(nir_shader_get_entrypoint(nir));
       kraid_compile_nir(nir, inputs, binary, info, idvs);
+      if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+          pan_arch(inputs->gpu_id) >= 13) {
+         bool coverage_read = false;
+         nir_shader_intrinsics_pass(nir, kraid_reads_rasterizer_coverage,
+                                    nir_metadata_all, &coverage_read);
+         info->fs.hsr.rasterizer_coverage_read = coverage_read;
+      }
 #else
       UNREACHABLE("Must have rust enabled");
 #endif
@@ -1925,6 +2387,141 @@ kraid_compile_variant(nir_shader *nir,
    }
 
    ralloc_free(clone);
+}
+
+static void
+kraid_compile_variants(nir_shader *nir, const struct pan_compile_inputs *inputs,
+                       struct util_dynarray *binary,
+                       struct pan_shader_info *info)
+{
+   if (nir->info.stage == MESA_SHADER_VERTEX && info->vs.idvs) {
+      /* On 5th Gen, IDVS is only in one binary */
+      if (pan_arch(inputs->gpu_id) >= 12)
+         kraid_compile_variant(nir, inputs, binary, info, KRAID_IDVS_ALL);
+      else {
+         kraid_compile_variant(nir, inputs, binary, info, KRAID_IDVS_POSITION);
+         kraid_compile_variant(nir, inputs, binary, info, KRAID_IDVS_VARYING);
+      }
+   } else {
+      kraid_compile_variant(nir, inputs, binary, info, KRAID_IDVS_NONE);
+   }
+}
+
+#define KRAID_FAU_ALIGN_SLACK 8
+
+static void
+kraid_compile_pilot(nir_shader *nir, const struct pan_compile_inputs *inputs,
+                    struct util_dynarray *binary, struct pan_shader_info *info);
+
+static void
+kraid_compile_tail(nir_shader *nir, const struct pan_compile_inputs *inputs,
+                   struct util_dynarray *binary, struct pan_shader_info *info)
+{
+   nir_shader *preamble = NULL, *preamble_main = NULL;
+   struct pan_compile_inputs main_inputs = *inputs;
+   struct pan_fau_virtual *virt = NULL;
+   if (inputs->preamble) {
+      virt = calloc(1, sizeof(*virt));
+      memset(virt->map, 0xff, sizeof(virt->map));
+      main_inputs.fau.virt = virt;
+      if (!(pan_get_compiler_flags(pan_arch(inputs->gpu_id)) & (1u << 28))) {
+         preamble_main = pan_nir_opt_preamble(nir, inputs, &preamble, virt);
+         if (preamble_main)
+            nir = preamble_main;
+      }
+      inputs = &main_inputs;
+   }
+   NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   uint64_t gpu_id = inputs->gpu_id;
+   NIR_PASS(_, nir, nir_lower_phis_to_scalar, bi_vectorize_filter, &gpu_id);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
+   NIR_PASS(_, nir, nir_opt_dce);
+
+   info->tls_size = nir->scratch_size;
+   info->stage = nir->info.stage;
+   info->fau.max = pan_max_push(inputs->gpu_id, inputs->gpu_variant);
+   info->fau.reserved = inputs->fau.reserved;
+   info->fau.count = inputs->fau.reserved;
+
+   if (virt && inputs->fau.pushable_ubos) {
+      unsigned used = ALIGN_POT(info->fau.reserved, 2);
+      if (!inputs->fau.push_ubo_handles)
+         used += pan_fau_virtual_words(virt) + KRAID_FAU_ALIGN_SLACK;
+      unsigned budget = info->fau.max > used ? info->fau.max - used : 0;
+      NIR_PASS(_, nir, pan_nir_opt_push_ubo, inputs, virt, budget,
+               &info->ubo_mask);
+   }
+   kraid_compile_variants(nir, inputs, binary, info);
+
+   if (info->stage == MESA_SHADER_VERTEX && info->vs.idvs) {
+      enum bi_idvs_mode mode =
+         pan_arch(inputs->gpu_id) >= 12 ? BI_IDVS_ALL : BI_IDVS_POSITION;
+      uint32_t size_prim = info->vs.secondary_offset ?: binary->size;
+      bifrost_dump_shader(nir, binary, mode, 0, size_prim);
+      if (info->vs.secondary_enable && mode != BI_IDVS_ALL) {
+         uint32_t offs = info->vs.secondary_offset;
+         uint32_t size_sec = binary->size - offs;
+         bifrost_dump_shader(nir, binary, BI_IDVS_VARYING, offs, size_sec);
+      }
+   } else {
+      bifrost_dump_shader(nir, binary, BI_IDVS_NONE, 0, binary->size);
+   }
+
+   info->ubo_mask &= (1 << nir->info.num_ubos) - 1;
+
+   if (preamble)
+      pan_nir_pilot_place_results(preamble, virt);
+
+   if (inputs->preamble && inputs->fau.push_ubo_handles)
+      pan_nir_pilot_add_fau_copies(&preamble, nir, &info->fau);
+
+   if (preamble) {
+      struct pan_compile_inputs pilot_inputs = *inputs;
+      pilot_inputs.preamble = NULL;
+      pilot_inputs.instrument = false;
+      pilot_inputs.no_idvs = true;
+      pilot_inputs.fau.reserved = 0;
+      pilot_inputs.fau.pushable_ubos = 0;
+      pilot_inputs.fau.push_ubo_handles = false;
+      pilot_inputs.fau.promote_immediates = false;
+      pilot_inputs.fau.virt = NULL;
+      kraid_compile_pilot(preamble, &pilot_inputs, &inputs->preamble->binary,
+                          &inputs->preamble->info);
+      ralloc_free(preamble);
+   }
+   ralloc_free(preamble_main);
+   free(virt);
+}
+
+typedef void (*bi_optimize_late_fn)(nir_shader *nir, uint64_t gpu_id,
+                                    const struct pan_shader_info *info,
+                                    bool reassoc);
+
+static void
+kraid_compile_shader(nir_shader *nir, const struct pan_compile_inputs *inputs,
+                     struct util_dynarray *binary, struct pan_shader_info *info,
+                     bi_optimize_late_fn optimize_late)
+{
+   optimize_late(nir, inputs->gpu_id, info, true);
+   bi_opt_late_uniform_reassoc(nir);
+   bi_optimize_late_finish(nir, inputs->gpu_id, inputs->gpu_variant);
+   kraid_compile_tail(nir, inputs, binary, info);
+}
+
+static void
+bi_optimize_pilot(nir_shader *nir, uint64_t gpu_id,
+                  UNUSED const struct pan_shader_info *info, bool reassoc)
+{
+   NIR_PASS(_, nir, nir_opt_shrink_vectors, false);
+   bi_optimize_late_alu(nir, gpu_id, reassoc);
+}
+
+static void
+kraid_compile_pilot(nir_shader *nir, const struct pan_compile_inputs *inputs,
+                    struct util_dynarray *binary, struct pan_shader_info *info)
+{
+   kraid_compile_shader(nir, inputs, binary, info, bi_optimize_pilot);
 }
 
 void
@@ -1944,19 +2541,13 @@ bifrost_compile_shader_nir(nir_shader *nir,
       bifrost_handle_unified_idvs_shader(nir);
    }
 
-   bi_optimize_late(nir, inputs->gpu_id, info);
-
-   nir_shader *preamble = NULL, *preamble_main = NULL;
-   struct pan_compile_inputs main_inputs = *inputs;
-   if (inputs->preamble && bi_use_kraid(nir, inputs->gpu_id) &&
-       !(pan_get_compiler_flags(pan_arch(inputs->gpu_id)) & (1u << 28))) {
-      preamble_main = pan_nir_opt_preamble(nir, inputs, &preamble,
-                                           &main_inputs.fau.reserved);
-      if (preamble_main) {
-         nir = preamble_main;
-         inputs = &main_inputs;
-      }
+   if (bi_use_kraid(nir, inputs->gpu_id)) {
+      kraid_compile_shader(nir, inputs, binary, info, bi_optimize_late);
+      return;
    }
+
+   bi_optimize_late(nir, inputs->gpu_id, info, false);
+   bi_optimize_late_finish(nir, inputs->gpu_id, inputs->gpu_variant);
 
    /* Lower constants to scalar but then immediately fold so we get minimum-
     * width vectors instead of scalars
@@ -1970,28 +2561,11 @@ bifrost_compile_shader_nir(nir_shader *nir,
 
    info->tls_size = nir->scratch_size;
    info->stage = nir->info.stage;
-   info->fau.max = PAN_MAX_PUSH;
+   info->fau.max = pan_max_push(inputs->gpu_id, inputs->gpu_variant);
    info->fau.reserved = inputs->fau.reserved;
    info->fau.count = inputs->fau.reserved;
 
-   if (bi_use_kraid(nir, gpu_id)) {
-      if (inputs->fau.pushable_ubos) {
-         NIR_PASS(_, nir, pan_nir_opt_push_ubo, inputs,
-                  &info->fau, &info->ubo_mask);
-      }
-
-      if (nir->info.stage == MESA_SHADER_VERTEX && info->vs.idvs) {
-         /* On 5th Gen, IDVS is only in one binary */
-         if (pan_arch(inputs->gpu_id) >= 12)
-            kraid_compile_variant(nir, inputs, binary, info, KRAID_IDVS_ALL);
-         else {
-            kraid_compile_variant(nir, inputs, binary, info, KRAID_IDVS_POSITION);
-            kraid_compile_variant(nir, inputs, binary, info, KRAID_IDVS_VARYING);
-         }
-      } else {
-         kraid_compile_variant(nir, inputs, binary, info, KRAID_IDVS_NONE);
-      }
-   } else if (nir->info.stage == MESA_SHADER_VERTEX && info->vs.idvs) {
+   if (nir->info.stage == MESA_SHADER_VERTEX && info->vs.idvs) {
       /* On 5th Gen, IDVS is only in one binary */
       if (pan_arch(inputs->gpu_id) >= 12)
          bi_compile_variant(nir, inputs, binary, info, BI_IDVS_ALL);
@@ -2019,20 +2593,4 @@ bifrost_compile_shader_nir(nir_shader *nir,
    }
 
    info->ubo_mask &= (1 << nir->info.num_ubos) - 1;
-
-   if (preamble) {
-      struct pan_compile_inputs pilot_inputs = *inputs;
-      pilot_inputs.preamble = NULL;
-      pilot_inputs.instrument = false;
-      pilot_inputs.no_idvs = true;
-      pilot_inputs.fau.reserved = 2;
-      pilot_inputs.fau.pushable_ubos = 0;
-      pilot_inputs.fau.push_ubo_handles = false;
-      pilot_inputs.fau.promote_immediates = false;
-      bifrost_compile_shader_nir(preamble, &pilot_inputs,
-                                 &inputs->preamble->binary,
-                                 &inputs->preamble->info);
-      ralloc_free(preamble);
-      ralloc_free(preamble_main);
-   }
 }

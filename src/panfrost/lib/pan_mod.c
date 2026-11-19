@@ -257,8 +257,8 @@ pan_mod_afbc_test_props(const struct pan_kmod_dev_props *dprops,
       return PAN_MOD_NOT_OPTIMAL;
 
    /* Prefer YTR when available. */
-   if (pan_afbc_can_ytr(iprops->format) &&
-       !(iprops->modifier & AFBC_FORMAT_MOD_YTR))
+   if (pan_afbc_can_ytr(iprops->format) !=
+       !!(iprops->modifier & AFBC_FORMAT_MOD_YTR))
       return PAN_MOD_NOT_OPTIMAL;
 
    /* Packing/unpacking AFBC payload requires a COMPUTE job which we'd rather
@@ -515,7 +515,7 @@ pan_mod_u_tiled_test_props(const struct pan_kmod_dev_props *dprops,
     * tiling does not make sense; using a linear layout instead is optimal
     * for both memory usage and performance.
     */
-   if (MIN2(iprops->extent_px.width, iprops->extent_px.height) < 2)
+   if (iprops->extent_px.height < 2)
       return PAN_MOD_NOT_OPTIMAL;
 
    return PAN_MOD_OPTIMAL;

@@ -57,12 +57,18 @@ libpanvk_files = files(
   'panvk_buffer.c',
   'panvk_cmd_pool.c',
   'panvk_device_memory.c',
+  'data_graph/panvk_data_graph.c',
+  'data_graph/panvk_data_graph_neural.c',
+  'panvk_dynamic_cache.c',
   'panvk_host_copy.c',
   'panvk_image.c',
   'panvk_instance.c',
   'panvk_mempool.c',
+  'panvk_nir_fold_passthrough_gs.c',
   'panvk_nir_lower_cooperative_matrix.c',
   'panvk_nir_lower_tile_image.c',
+  'panvk_nir_opt_rt_calls.c',
+  'data_graph/panvk_nir_data_graph.c',
   'panvk_perf_counters_by_region.c',
   'panvk_physical_device.c',
   'panvk_priv_bo.c',
@@ -95,6 +101,7 @@ fifthgen_files = []
 tensor_archs = [15]
 tensor_files = [
   'panvk_vX_tensor.c',
+  'data_graph/panvk_vX_data_graph.c',
 ]
 
 jm_archs = [6, 7]
@@ -117,12 +124,13 @@ csf_files = [
   'csf/panvk_vX_cmd_cond_render.c',
   'csf/panvk_vX_cmd_dgc.c',
   'csf/panvk_vX_cmd_dispatch.c',
+  'csf/panvk_vX_cmd_dynamic_cache.c',
   'csf/panvk_vX_cmd_draw.c',
   'csf/panvk_vX_cmd_event.c',
   'csf/panvk_vX_cmd_xfb.c',
   'csf/panvk_vX_cmd_query.c',
   'csf/panvk_vX_cmd_precomp.c',
-  'csf/panvk_vX_cmd_preamble.c',
+  'csf/panvk_vX_cmd_pilot.c',
   'csf/panvk_vX_cmd_shader_instrumentation.c',
   'csf/panvk_vX_dgc.c',
   'csf/panvk_vX_dgc_submit.c',
@@ -134,10 +142,12 @@ csf_files = [
 ]
 
 subdir('bvh')
+subdir('bcn')
 
 rt_archs = [15]
 rt_files = [
   'panvk_vX_acceleration_structure.c',
+  'panvk_vX_micromap.c',
   'panvk_vX_nir_lower_ray_queries.c',
   'panvk_vX_nir_rt_traversal.c',
   'panvk_vX_nir_rt_pipeline.c',
@@ -152,6 +162,7 @@ common_per_arch_files = [
   panvk_tracepoints[0],
   panvk_drirc[1],
   'panvk_vX_blend.c',
+  'panvk_vX_blend_state.c',
   'panvk_vX_buffer_view.c',
   'panvk_vX_cmd_desc_state.c',
   'panvk_vX_cmd_dispatch.c',
@@ -194,6 +205,11 @@ foreach arch : [6, 7, 10, 11, 12, 13, 14, 15]
 
   if arch in rt_archs
     per_arch_files += rt_files
+  endif
+
+  if arch in csf_archs
+    per_arch_files += ['panvk_vX_bc_emu.c', panvk_bcn_spv, panvk_bcn_3d_spv, panvk_bcn_astc_spv,
+                       'panvk_vX_copy_blocks.c', panvk_copy_blocks_spv]
   endif
 
   if arch in jm_archs
@@ -331,3 +347,228 @@ _dev_icd = custom_target(
 )
 
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
+
+if with_tests
+  test(
+    'panvk_data_graph_quantized',
+    executable(
+      'panvk_data_graph_quantized_test',
+      files('data_graph/tests/test-data-graph-quantized.c', 'data_graph/panvk_data_graph.c',
+            'data_graph/panvk_nir_data_graph.c'),
+      link_with : libpanfrost_lib,
+      include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+      dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers,
+                      idep_vulkan_util],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_data_graph_neural',
+    executable(
+      'panvk_data_graph_neural_test',
+      files('data_graph/tests/test-data-graph-neural.c', 'data_graph/panvk_data_graph_neural.c'),
+      include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+      dependencies : [idep_nir, idep_vulkan_runtime_headers],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_data_graph',
+    executable(
+      'panvk_data_graph_test',
+      files('data_graph/tests/test-data-graph.c', 'data_graph/panvk_data_graph.c',
+            'data_graph/panvk_data_graph_neural.c', 'data_graph/panvk_nir_data_graph.c'),
+      link_with : libpanfrost_lib,
+      include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+      dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers,
+                      idep_vulkan_util],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_data_graph_transforms',
+    executable(
+      'panvk_data_graph_transforms_test',
+      files('data_graph/tests/test-data-graph-transforms.c', 'data_graph/panvk_data_graph.c',
+            'data_graph/panvk_nir_data_graph.c'),
+      link_with : libpanfrost_lib,
+      include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+      dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers,
+                      idep_vulkan_util],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_data_graph_transform_coverage',
+    executable(
+      'panvk_data_graph_transform_coverage_test',
+      files('data_graph/tests/test-data-graph-transform-coverage.c', 'data_graph/panvk_data_graph.c',
+            'data_graph/panvk_nir_data_graph.c'),
+      link_with : libpanfrost_lib,
+      include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+      dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers,
+                      idep_vulkan_util],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_data_graph_operators',
+    executable(
+      'panvk_data_graph_operators_test',
+      files('data_graph/tests/test-data-graph-operators.c', 'data_graph/panvk_data_graph.c',
+            'data_graph/panvk_nir_data_graph.c'),
+      link_with : libpanfrost_lib,
+      include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+      dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers,
+                      idep_vulkan_util],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_data_graph_integer_types',
+    executable(
+      'panvk_data_graph_integer_types_test',
+      files('data_graph/tests/test-data-graph-integer-types.c', 'data_graph/panvk_data_graph.c',
+            'data_graph/panvk_data_graph_neural.c', 'data_graph/panvk_nir_data_graph.c'),
+      link_with : libpanfrost_lib,
+      include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+      dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers,
+                      idep_vulkan_util],
+    ),
+    suite : ['panfrost'],
+  )
+  if cc.has_argument('-ffunction-sections') and cc.has_link_argument('-Wl,--gc-sections')
+    test(
+      'panvk_tensor_format_features',
+      executable(
+        'panvk_tensor_format_features_test',
+        files('tests/test-tensor-format-features.c', 'panvk_tensor.c'),
+        c_args : ['-ffunction-sections', '-fdata-sections'],
+        link_args : ['-Wl,--gc-sections'],
+        link_with : libpanfrost_lib,
+        include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+        dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers,
+                        idep_vulkan_util, idep_vulkan_wsi_headers],
+      ),
+      suite : ['panfrost'],
+    )
+  endif
+  if cc.has_link_argument('-Wl,--wrap=malloc') and cc.has_link_argument('-Wl,--wrap=calloc')
+    test(
+      'panvk_data_graph_operator_oom',
+      executable(
+        'panvk_data_graph_operator_oom_test',
+        files('data_graph/tests/test-data-graph-operators.c', 'data_graph/panvk_data_graph.c',
+              'data_graph/panvk_nir_data_graph.c'),
+        c_args : ['-DPANVK_GRAPH_TEST_ALLOC_FAILURE'],
+        link_args : ['-Wl,--wrap=malloc', '-Wl,--wrap=calloc'],
+        link_with : libpanfrost_lib,
+        include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+        dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers,
+                        idep_vulkan_util],
+      ),
+      suite : ['panfrost'],
+    )
+    test(
+      'panvk_data_graph_transform_oom',
+      executable(
+        'panvk_data_graph_transform_oom_test',
+        files('data_graph/tests/test-data-graph-transform-coverage.c', 'data_graph/panvk_data_graph.c',
+              'data_graph/panvk_nir_data_graph.c'),
+        c_args : ['-DPANVK_GRAPH_TEST_ALLOC_FAILURE'],
+        link_args : ['-Wl,--wrap=malloc', '-Wl,--wrap=calloc'],
+        link_with : libpanfrost_lib,
+        include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+        dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers,
+                        idep_vulkan_util],
+      ),
+      suite : ['panfrost'],
+    )
+  endif
+  test(
+    'panvk_rt_calls',
+    executable(
+      'panvk_rt_calls_test',
+      files('tests/test-rt-calls.c', 'panvk_nir_opt_rt_calls.c'),
+      include_directories : [inc_include, inc_src, inc_panfrost, include_directories('.', 'data_graph')],
+      dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_rt_capture_replay',
+    executable(
+      'panvk_rt_capture_replay_test',
+      files('tests/test-rt-capture-replay.c', 'panvk_vX_rt_pipeline.c', 'panvk_rt_shader_group.c'),
+      include_directories : [inc_include, inc_src, inc_panfrost, csf_inc_dir],
+      dependencies : [idep_nir, idep_mesautil, idep_pan_packers,
+                      idep_vulkan_runtime_headers, idep_vulkan_util_headers,
+                      idep_vulkan_wsi_headers, idep_libpan_per_arch['15']],
+      c_args : ['-DPAN_ARCH=15', '-ffunction-sections', '-fdata-sections'],
+      link_args : ['-Wl,--gc-sections'],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_rt_position_fetch',
+    executable(
+      'panvk_rt_position_fetch_test',
+      files('tests/test-rt-position-fetch.c', 'panvk_vX_nir_rt_traversal.c'),
+      include_directories : [inc_include, inc_src, inc_panfrost],
+      dependencies : [idep_nir, idep_mesautil, idep_vulkan_runtime_headers],
+      c_args : ['-DPAN_ARCH=15'],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_dynamic_cache',
+    executable(
+      'panvk_dynamic_cache_test',
+      files('test-dynamic-cache.c', 'panvk_dynamic_cache.c'),
+      include_directories : [inc_include, inc_src, inc_panfrost],
+      dependencies : [idep_mesautil, idep_vulkan_util, idep_vulkan_runtime, dep_thread],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_push_descriptors',
+    executable(
+      'panvk_push_descriptors_test',
+      files('tests/test-push-descriptors.c', 'panvk_vX_descriptor_set_layout.c',
+            'panvk_vX_descriptor_set.c'),
+      link_with : libpanfrost_lib,
+      include_directories : [inc_include, inc_src, inc_panfrost, csf_inc_dir,
+                             include_directories('.', 'data_graph')],
+      dependencies : [idep_nir, idep_mesautil, idep_pan_packers,
+                      idep_vulkan_runtime, idep_vulkan_util,
+                      idep_vulkan_wsi_headers, idep_libpan_per_arch['15']],
+      c_args : ['-DPAN_ARCH=15', '-ffunction-sections', '-fdata-sections'],
+      link_args : ['-Wl,--gc-sections'],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_tensor_relocation',
+    executable(
+      'panvk_tensor_relocation_test',
+      files('tests/test-tensor-relocation.c'),
+      include_directories : [inc_include, inc_src, inc_panfrost,
+                             include_directories('.', 'data_graph')],
+      dependencies : [idep_mesautil, idep_pan_packers],
+      c_args : ['-DPAN_ARCH=15'],
+    ),
+    suite : ['panfrost'],
+  )
+  test(
+    'panvk_data_graph_csf',
+    executable(
+      'panvk_data_graph_csf_test',
+      files('data_graph/tests/test-data-graph-csf.c'),
+      include_directories : [inc_include, inc_src, inc_panfrost,
+                             include_directories('.', 'data_graph')],
+      dependencies : [idep_mesautil, idep_pan_packers],
+      c_args : ['-DPAN_ARCH=15'],
+    ),
+    suite : ['panfrost'],
+  )
+endif

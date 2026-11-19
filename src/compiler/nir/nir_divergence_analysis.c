@@ -402,9 +402,12 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_scalar_arg_amd:
    case nir_intrinsic_load_vertex_param_buffer_poly:
    case nir_intrinsic_load_tess_param_buffer_poly:
+   case nir_intrinsic_load_geometry_param_buffer_poly:
    case nir_intrinsic_load_ro_sink_address_poly:
+   case nir_intrinsic_load_provoking_last:
    case nir_intrinsic_load_frame_arg_pan:
    case nir_intrinsic_load_noperspective_varyings_pan:
+   case nir_intrinsic_load_clip_cull_count_pan:
    case nir_intrinsic_load_multisampled_pan:
    case nir_intrinsic_load_rt_conversion_pan:
    case nir_intrinsic_subgroup_barrier_index_intel:
@@ -552,6 +555,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_layer_id:
    case nir_intrinsic_load_front_face:
    case nir_intrinsic_load_front_face_fsign:
+   case nir_intrinsic_load_primitive_flags_pan:
    case nir_intrinsic_load_back_face_agx:
       assert(stage == MESA_SHADER_FRAGMENT || state->shader->info.internal);
       is_divergent = !(options & nir_divergence_single_prim_per_subgroup);
@@ -933,6 +937,10 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
       break;
 
    /* Intrinsics which are always divergent */
+   case nir_intrinsic_load_rt_arg_pan:
+   case nir_intrinsic_load_rt_frame_size_pan:
+   case nir_intrinsic_load_rt_tls_base_pan:
+   case nir_intrinsic_rt_call_result_pan:
    case nir_intrinsic_inverse_ballot:
    case nir_intrinsic_load_color0_amd:
    case nir_intrinsic_load_color1_amd:
@@ -1148,6 +1156,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_tile_res_pan:
    case nir_intrinsic_load_cumulative_coverage_pan:
    case nir_intrinsic_load_blend_input_pan:
+   case nir_intrinsic_load_pilot_arg_pan:
    case nir_intrinsic_load_idvs_output_buf_index_pan:
    case nir_intrinsic_load_sample_centroid_pan:
    case nir_intrinsic_atest_pan:

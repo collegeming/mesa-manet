@@ -3,8 +3,10 @@
 
 use crate::data_type::NumericType;
 use crate::ir::*;
-use crate::ops::{BranchCombineOp, CmpAccumOp, CmpOp, CmpResultType, LogicOp, MuxOp,
-                 OpCSel, OpCopy, OpFCmp, OpICmp, OpMux, OpShiftLop, ShiftOp};
+use crate::legalize::{src_copy_keys, CopyKey};
+use crate::ops::{BranchCombineOp, CmpAccumOp, CmpOp, CmpResultType, FClamp,
+                 FMinMax3Op, LogicOp, MuxOp, OpCSel, OpCopy, OpFCmp,
+                 OpFMinMax3, OpICmp, OpMux, OpShiftLop, ShiftOp};
 use crate::ssa_value::AllocSSA;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -75,6 +77,16 @@ impl Comparison {
         };
         supported_op(merged, model)
     }
+}
+
+fn inlines_compare_imm(op: &Op, model: &dyn Model) -> bool {
+    let Op::CSel(csel) = op else {
+        return false;
+    };
+    csel.cmp_srcs.iter().any(|src| match &src.src_ref {
+        SrcRef::Imm32(imm) => model.op_src_supports_imm32(op, src, imm.get()),
+        _ => false,
+    })
 }
 
 fn supported_op(op: Op, model: &dyn Model) -> Option<Op> {
@@ -251,9 +263,172 @@ mod tests {
     use crate::model::model_for_gpu_id;
     use crate::ops::OpFCmp;
     use crate::ssa_value::{AllocSSA, SSAValueAllocator};
-    use crate::ops::{OpCopy, OpRegOut};
+    use crate::ops::{OpCopy, OpFMax, OpFMin, OpRegOut};
     use compiler::cfg::CFGBuilder;
     use rustc_hash::FxBuildHasher;
+
+    const V15_GPU_ID: u64 = 0x0f08_0000_f000_0000;
+
+    fn one_block_shader<'a>(model: &'a dyn Model, alloc: SSAValueAllocator,
+                            instrs: Vec<Instr>) -> Shader<'a> {
+        let mut cfg: CFGBuilder<usize, BasicBlock, FxBuildHasher> = CFGBuilder::new();
+        cfg.add_node(0, BasicBlock { label: LabelAllocator::default().alloc(), instrs });
+        Shader { model, ssa_alloc: alloc, phi_alloc: Default::default(),
+                 blocks: cfg.as_cfg(false), info: ShaderInfo::default(),
+                 constant_pool: None }
+    }
+
+    fn defs(vals: &[&SSARef]) -> Vec<Instr> {
+        vals.iter().enumerate().map(|(i, v)| OpCopy {
+            dst: (*v).clone().into(), dst_type: DataType::I32,
+            src: (0x3f80_0000_u32 + i as u32).into(),
+        }.into()).collect()
+    }
+
+    fn reg_out(idx: u8, src: Src) -> Instr {
+        OpRegOut { reg: RegRef::new(idx, RegRange::Regs(1)),
+                   src_type: DataType::I32, src }.into()
+    }
+
+    fn minmax(max: bool, dst: Dst, srcs: [Src; 2], propagate_nan: bool,
+              clamp: FClamp) -> Instr {
+        if max {
+            OpFMax { dst, dst_type: DataType::F32, propagate_nan, clamp, srcs }.into()
+        } else {
+            OpFMin { dst, dst_type: DataType::F32, propagate_nan, clamp, srcs }.into()
+        }
+    }
+
+    #[test]
+    fn minmax_chains_become_three_source_ops() {
+        let model = model_for_gpu_id(V15_GPU_ID, 4).unwrap();
+        let cases = [
+            (false, false, Some(FMinMax3Op::Min)),
+            (true, true, Some(FMinMax3Op::Max)),
+            (false, true, Some(FMinMax3Op::Clamp)),
+            (true, false, None),
+        ];
+        for (outer_max, inner_max, expected) in cases {
+            for inner_src in [0, 1] {
+                let mut alloc = SSAValueAllocator::default();
+                let [a, b, c, t, r] = [(); 5].map(|_| alloc.alloc_ref(32));
+                let mut outer_srcs = [Src::from(t.clone()), Src::from(c.clone())];
+                outer_srcs.swap(0, inner_src);
+                let mut instrs = defs(&[&a, &b, &c]);
+                instrs.extend([
+                    minmax(inner_max, t.into(), [a.clone().into(), b.clone().into()],
+                           false, FClamp::None),
+                    minmax(outer_max, r.clone().into(), outer_srcs, false, FClamp::None),
+                    reg_out(0, r.into()),
+                ]);
+                let mut s = one_block_shader(model.as_ref(), alloc, instrs);
+                s.opt_exec_units();
+                let fused: Vec<&OpFMinMax3> = s.blocks[0].instrs.iter()
+                    .filter_map(|i| match &i.op { Op::FMinMax3(op) => Some(op.as_ref()), _ => None })
+                    .collect();
+                assert_eq!(fused.len(), usize::from(expected.is_some()));
+                if let Some(op) = fused.first() {
+                    assert!(Some(op.op) == expected);
+                    assert!(op.srcs.iter().map(|s| s.src_ref.clone()).eq(
+                        [SrcRef::from(a), SrcRef::from(b), SrcRef::from(c)]));
+                    assert_eq!(s.blocks[0].instrs.len(), 5);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn minmax_chains_keep_shared_or_modified_values() {
+        let model = model_for_gpu_id(V15_GPU_ID, 4).unwrap();
+        for case in 0..4 {
+            let mut alloc = SSAValueAllocator::default();
+            let [a, b, c, t, r] = [(); 5].map(|_| alloc.alloc_ref(32));
+            let inner_clamp = if case == 1 { FClamp::ZeroToOne } else { FClamp::None };
+            let outer_nan = case == 2;
+            let mut t_src = Src::from(t.clone());
+            if case == 3 {
+                t_src.src_mod = SrcMod::FNeg;
+            }
+            let mut instrs = defs(&[&a, &b, &c]);
+            instrs.extend([
+                minmax(false, t.clone().into(), [a.into(), b.into()], false, inner_clamp),
+                minmax(false, r.clone().into(), [t_src, c.into()], outer_nan, FClamp::None),
+                reg_out(0, r.into()),
+            ]);
+            if case == 0 {
+                instrs.push(reg_out(1, t.into()));
+            }
+            let mut s = one_block_shader(model.as_ref(), alloc, instrs);
+            s.opt_exec_units();
+            assert!(!s.blocks[0].instrs.iter().any(|i| matches!(i.op, Op::FMinMax3(_))));
+        }
+    }
+
+    #[test]
+    fn minmax_chains_need_three_source_ops() {
+        let model = model_for_gpu_id(0xa0000000, 0).unwrap();
+        let mut alloc = SSAValueAllocator::default();
+        let [a, b, c, t, r] = [(); 5].map(|_| alloc.alloc_ref(32));
+        let mut instrs = defs(&[&a, &b, &c]);
+        instrs.extend([
+            minmax(false, t.clone().into(), [a.into(), b.into()], false, FClamp::None),
+            minmax(false, r.clone().into(), [t.into(), c.into()], false, FClamp::None),
+            reg_out(0, r.into()),
+        ]);
+        let mut s = one_block_shader(model.as_ref(), alloc, instrs);
+        s.opt_exec_units();
+        assert!(!s.blocks[0].instrs.iter().any(|i| matches!(i.op, Op::FMinMax3(_))));
+    }
+
+    #[test]
+    fn small_immediate_compares_fold_into_selects() {
+        let v15 = model_for_gpu_id(V15_GPU_ID, 4).unwrap();
+        let v10 = model_for_gpu_id(0xa0000000, 0).unwrap();
+        let cases = [
+            (DataType::U32, CmpOp::Eq, 5_u32, true),
+            (DataType::U32, CmpOp::Eq, 255, true),
+            (DataType::U32, CmpOp::Eq, 256, false),
+            (DataType::U32, CmpOp::Ne, 5, true),
+            (DataType::U32, CmpOp::Ge, 5, true),
+            (DataType::U32, CmpOp::Le, 254, true),
+            (DataType::U32, CmpOp::Le, 255, false),
+            (DataType::U32, CmpOp::Lt, 0x8000_0000, false),
+            (DataType::S32, CmpOp::Gt, 127, true),
+            (DataType::S32, CmpOp::Gt, 128, false),
+            (DataType::S32, CmpOp::Eq, 200, true),
+            (DataType::S32, CmpOp::Lt, (-3_i32) as u32, false),
+            (DataType::S32, CmpOp::Le, u32::MAX, true),
+        ];
+        for (model, expect_any) in [(&v15, true), (&v10, false)] {
+            for (src_type, cmp_op, imm, fold) in cases {
+                let mut alloc = SSAValueAllocator::default();
+                let [x, p, a, b, r] = [(); 5].map(|_| alloc.alloc_ref(32));
+                let mut instrs = defs(&[&x, &a, &b]);
+                instrs.extend::<[Instr; 3]>([
+                    OpICmp {
+                        dst: p.clone().into(), src_type, res_type: CmpResultType::M1,
+                        cmp_op, srcs: [x.into(), imm.into()], accum: 0_u32.into(),
+                        accum_op: CmpAccumOp::None,
+                    }.into(),
+                    OpCSel {
+                        dst: r.clone().into(), cmp_type: DataType::S32, cmp_op: CmpOp::Ne,
+                        cmp_srcs: [p.into(), 0_u32.into()], sel_srcs: [a.into(), b.into()],
+                    }.into(),
+                    reg_out(0, r.into()),
+                ]);
+                let mut s = one_block_shader(model.as_ref(), alloc, instrs);
+                s.opt_select_immediates();
+                let folded = !s.blocks[0].instrs.iter().any(|i| matches!(i.op, Op::ICmp(_)));
+                assert_eq!(folded, fold && expect_any, "{src_type} {imm:#x}");
+                if folded {
+                    let sel_instr = s.blocks[0].instrs.iter()
+                        .find(|i| matches!(i.op, Op::CSel(_))).unwrap();
+                    let Op::CSel(sel) = &sel_instr.op else { unreachable!() };
+                    assert!(model.op_src_supports_imm32(&sel_instr.op, &sel.cmp_srcs[1], imm));
+                }
+            }
+        }
+    }
 
     fn logic(dst: Dst, src0: Src, src2: Src, logic_op: LogicOp) -> OpShiftLop {
         OpShiftLop {
@@ -641,6 +816,52 @@ fn csel_zero_reg_helps(op: &OpCSel) -> bool {
     words.len() == 2 && slots.len() <= 1
 }
 
+fn minmax_parts(op: &Op) -> Option<(FMinMax3Op, DataType, bool, &Dst, &[Src; 2])> {
+    match op {
+        Op::FMin(op) if op.clamp == FClamp::None => Some((
+            FMinMax3Op::Min, op.dst_type, op.propagate_nan, &op.dst, &op.srcs,
+        )),
+        Op::FMax(op) if op.clamp == FClamp::None => Some((
+            FMinMax3Op::Max, op.dst_type, op.propagate_nan, &op.dst, &op.srcs,
+        )),
+        _ => None,
+    }
+}
+
+fn minmax_def(instr: &Instr) -> Option<SSAValue> {
+    let (_, _, _, dst, _) = minmax_parts(&instr.op)?;
+    if instr.flow != FlowCtrl::NONE || dst.lanes != DstLanes::All {
+        return None;
+    }
+    let vec = dst.dst_ref.as_ssa()?;
+    (vec.comps() == 1 && vec[0].bits() == 32).then(|| vec[0])
+}
+
+fn merge_minmax(outer: &Instr, inner: &Instr, inner_src: usize,
+                model: &dyn Model) -> Option<Op> {
+    let (outer_op, dst_type, propagate_nan, dst, srcs) = minmax_parts(&outer.op)?;
+    let (inner_op, inner_type, inner_nan, _, inner_srcs) = minmax_parts(&inner.op)?;
+    let op = match (outer_op, inner_op) {
+        (FMinMax3Op::Min, FMinMax3Op::Min) => FMinMax3Op::Min,
+        (FMinMax3Op::Max, FMinMax3Op::Max) => FMinMax3Op::Max,
+        (FMinMax3Op::Min, FMinMax3Op::Max) => FMinMax3Op::Clamp,
+        _ => return None,
+    };
+    if outer.flow != FlowCtrl::NONE || inner_type != dst_type
+        || inner_nan != propagate_nan
+    {
+        return None;
+    }
+    supported_op(OpFMinMax3 {
+        dst: dst.clone(),
+        dst_type,
+        op,
+        propagate_nan,
+        srcs: [inner_srcs[0].clone(), inner_srcs[1].clone(),
+               srcs[1 - inner_src].clone()],
+    }.into(), model)
+}
+
 fn translate_instr(i: &mut Instr) {
     if let Op::Mux(op) = &mut i.op {
         if let Some(csel) = try_replace_mux_csel(op) {
@@ -649,99 +870,313 @@ fn translate_instr(i: &mut Instr) {
     }
 }
 
-impl Shader<'_> {
-    /// Tries to replace operations with cheaper, equivalent ones.  The only
-    /// example right now is MUX being replaced with CSEL (SFU -> CVT), we might
-    /// want this list to be expanded in the future.  Must run before
-    /// legalization as we are inserting a 0 source that might conflict with
-    /// other FAUs (in v9-v10).
-    pub fn opt_exec_units(&mut self) {
-        let mut uses: FxHashMap<SSAValue, usize> = FxHashMap::default();
-        for block in self.blocks.iter() {
+struct Fold {
+    block: usize,
+    ip: usize,
+    op: Op,
+    old_keys: Vec<CopyKey>,
+    new_keys: Vec<CopyKey>,
+}
+
+struct CompareDef {
+    cmp: Comparison,
+    block: usize,
+    keys: Vec<CopyKey>,
+    uses: usize,
+    folds: Vec<Fold>,
+}
+
+struct CopyCounts(Vec<FxHashMap<CopyKey, u32>>);
+
+impl CopyCounts {
+    fn for_shader(s: &Shader<'_>) -> Self {
+        CopyCounts(s.blocks.iter().map(|block| {
+            let mut counts: FxHashMap<CopyKey, u32> = FxHashMap::default();
             for instr in &block.instrs {
-                for ssa in instr.iter_ssa_uses() {
-                    *uses.entry(*ssa).or_default() += 1;
+                for key in src_copy_keys(s.model, &instr.op) {
+                    *counts.entry(key).or_default() += 1;
+                }
+            }
+            counts
+        }).collect())
+    }
+
+    fn replace(&mut self, block: usize, old: &[CopyKey], new: &[CopyKey]) -> isize {
+        let counts = &mut self.0[block];
+        let mut delta = 0;
+        for key in new {
+            let count = counts.entry(*key).or_default();
+            if *count == 0 {
+                delta += 1;
+            }
+            *count += 1;
+        }
+        for key in old {
+            let count = counts.get_mut(key).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                delta -= 1;
+            }
+        }
+        delta
+    }
+
+    fn fold_all(&mut self, def: &CompareDef, folds: &[&Fold]) -> isize {
+        let mut delta = self.replace(def.block, &def.keys, &[]) - 1;
+        for fold in folds {
+            delta += self.replace(fold.block, &fold.old_keys, &fold.new_keys);
+        }
+        delta
+    }
+
+    fn unfold_all(&mut self, def: &CompareDef, folds: &[&Fold]) {
+        for fold in folds {
+            self.replace(fold.block, &fold.new_keys, &fold.old_keys);
+        }
+        self.replace(def.block, &[], &def.keys);
+    }
+}
+
+impl Shader<'_> {
+    fn collect_compares(&self) -> FxHashMap<SSAValue, CompareDef> {
+        let model = self.model;
+        let mut defs: FxHashMap<SSAValue, CompareDef> = FxHashMap::default();
+        for (bi, block) in self.blocks.iter().enumerate() {
+            for instr in &block.instrs {
+                if let Some((ssa, cmp)) = Comparison::from_instr(instr) {
+                    let keys = src_copy_keys(model, &instr.op);
+                    defs.insert(ssa, CompareDef {
+                        cmp, block: bi, keys, uses: 0, folds: Vec::new(),
+                    });
                 }
             }
         }
+        for instr in self.blocks.iter().flat_map(|block| &block.instrs) {
+            for ssa in instr.iter_ssa_uses() {
+                if let Some(def) = defs.get_mut(ssa) {
+                    def.uses += 1;
+                }
+            }
+        }
+        defs
+    }
+
+    fn collect_folds(&self, defs: &mut FxHashMap<SSAValue, CompareDef>,
+                     masks: &BooleanMasks, imm_only: bool) {
         let model = self.model;
-        let zero_free = model.fau().is_zero_free;
+        for (bi, block) in self.blocks.iter().enumerate() {
+            for (ip, instr) in block.instrs.iter().enumerate() {
+                let fold = |merged: Op| Fold {
+                    block: bi,
+                    ip,
+                    old_keys: src_copy_keys(model, &instr.op),
+                    new_keys: src_copy_keys(model, &merged),
+                    op: merged,
+                };
+                match &instr.op {
+                    Op::CSel(op) => {
+                        let Some(ssa) = select_predicate(op) else { continue; };
+                        let Some(def) = defs.get_mut(&ssa) else { continue; };
+                        if let Some(merged) = def.cmp.merge_select(op, model) {
+                            if !imm_only || inlines_compare_imm(&merged, model) {
+                                def.folds.push(fold(merged));
+                            }
+                        }
+                    }
+                    Op::ShiftLop(op) if !imm_only && instr.flow == FlowCtrl::NONE => {
+                        let Some(inputs) = accum_inputs(op) else { continue; };
+                        for (src, accum) in inputs {
+                            let Some(ssa) = plain_scalar_ssa(src) else { continue; };
+                            if !masks.contains(accum) {
+                                continue;
+                            }
+                            let Some(def) = defs.get_mut(&ssa) else { continue; };
+                            if let Some(merged) = def.cmp.merge_accum(op, accum, model) {
+                                def.folds.push(fold(merged));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn fold_compares(&mut self, masks: &BooleanMasks, imm_only: bool) -> bool {
+        let mut defs = self.collect_compares();
+        self.collect_folds(&mut defs, masks, imm_only);
+        let mut counts = CopyCounts::for_shader(self);
+        let mut order: Vec<(isize, usize, SSAValue)> = defs.iter()
+            .filter(|(_, def)| !def.folds.is_empty())
+            .map(|(ssa, def)| {
+                let folds: Vec<&Fold> = def.folds.iter().collect();
+                let delta = if folds.len() == def.uses {
+                    let delta = counts.fold_all(def, &folds);
+                    counts.unfold_all(def, &folds);
+                    delta
+                } else {
+                    0
+                };
+                (delta, def.uses, *ssa)
+            }).collect();
+        order.sort_unstable_by_key(|&(delta, uses, ssa)| (delta, uses, ssa.idx()));
+        let mut taken: FxHashSet<(usize, usize)> = FxHashSet::default();
+        let mut progress = false;
+        for (_, _, ssa) in order {
+            let def = defs.remove(&ssa).unwrap();
+            let folds: Vec<&Fold> = def.folds.iter()
+                .filter(|fold| !taken.contains(&(fold.block, fold.ip))).collect();
+            let mut apply: Vec<&Fold> = Vec::new();
+            if folds.len() == def.uses {
+                if counts.fold_all(&def, &folds) < 0 {
+                    apply = folds;
+                } else {
+                    counts.unfold_all(&def, &folds);
+                }
+            }
+            if apply.is_empty() {
+                for fold in def.folds.iter()
+                    .filter(|fold| !taken.contains(&(fold.block, fold.ip)))
+                {
+                    if counts.replace(fold.block, &fold.old_keys, &fold.new_keys) < 0 {
+                        apply.push(fold);
+                    } else {
+                        counts.replace(fold.block, &fold.new_keys, &fold.old_keys);
+                    }
+                }
+            }
+            for fold in apply {
+                taken.insert((fold.block, fold.ip));
+                self.blocks[fold.block].instrs[fold.ip].op = fold.op.clone();
+                progress = true;
+            }
+        }
+        progress
+    }
+
+    fn fold_minmax3(&mut self) -> bool {
+        let model = self.model;
+        let mut uses: FxHashMap<SSAValue, usize> = FxHashMap::default();
+        for instr in self.blocks.iter().flat_map(|block| &block.instrs) {
+            for ssa in instr.iter_ssa_uses() {
+                *uses.entry(*ssa).or_default() += 1;
+            }
+        }
+        let mut counts = CopyCounts::for_shader(self);
+        let mut progress = false;
+        for bi in 0..self.blocks.len() {
+            let mut defs: FxHashMap<SSAValue, usize> = FxHashMap::default();
+            for ip in 0..self.blocks[bi].instrs.len() {
+                let instrs = &self.blocks[bi].instrs;
+                let outer = &instrs[ip];
+                let mut merged = None;
+                if let Some((_, _, _, _, srcs)) = minmax_parts(&outer.op) {
+                    for (i, src) in srcs.iter().enumerate() {
+                        let Some(ssa) = plain_scalar_ssa(src) else { continue; };
+                        let Some(&def_ip) = defs.get(&ssa) else { continue; };
+                        if uses.get(&ssa) != Some(&1) {
+                            continue;
+                        }
+                        let inner = &instrs[def_ip];
+                        let Some(op) = merge_minmax(outer, inner, i, model) else {
+                            continue;
+                        };
+                        let old: Vec<CopyKey> = src_copy_keys(model, &inner.op)
+                            .into_iter()
+                            .chain(src_copy_keys(model, &outer.op))
+                            .collect();
+                        let new = src_copy_keys(model, &op);
+                        if counts.replace(bi, &old, &new) > 0 {
+                            counts.replace(bi, &new, &old);
+                            continue;
+                        }
+                        defs.remove(&ssa);
+                        merged = Some(op);
+                        break;
+                    }
+                }
+                if let Some(op) = merged {
+                    self.blocks[bi].instrs[ip].op = op;
+                    progress = true;
+                } else if let Some(ssa) = minmax_def(&self.blocks[bi].instrs[ip]) {
+                    defs.insert(ssa, ip);
+                }
+            }
+        }
+        progress
+    }
+
+    fn share_csel_zero(&mut self) -> bool {
+        let mut progress = false;
+        for block in self.blocks.iter_mut() {
+            let zero_users: Vec<usize> = block.instrs.iter().enumerate()
+                .filter(|(_, instr)| matches!(&instr.op, Op::CSel(op) if csel_zero_reg_helps(op)))
+                .map(|(ip, _)| ip).collect();
+            if zero_users.len() < 2 {
+                continue;
+            }
+            let zero = self.ssa_alloc.alloc_ssa(32);
+            for &ip in &zero_users {
+                if let Op::CSel(op) = &mut block.instrs[ip].op {
+                    op.cmp_srcs[1] = SSARef::from(zero).into();
+                }
+            }
+            block.instrs.insert(
+                zero_users[0],
+                OpCopy {
+                    dst: SSARef::from(zero).into(),
+                    dst_type: DataType::I32,
+                    src: 0_u32.into(),
+                }
+                .into(),
+            );
+            progress = true;
+        }
+        progress
+    }
+
+    pub fn opt_select_immediates(&mut self) {
+        if self.model.fau().is_zero_free {
+            for instr in self.blocks.iter_mut().flat_map(|block| &mut block.instrs) {
+                translate_instr(instr);
+            }
+        }
+        let masks = BooleanMasks::default();
+        if self.fold_compares(&masks, true) {
+            self.opt_dce();
+        }
+    }
+
+    /// Tries to replace operations with cheaper, equivalent ones: MUX becomes
+    /// CSEL (SFU -> CVT), branch conditions are simplified and comparisons
+    /// are folded into the selects and logic operations that consume them.
+    /// Must run before legalization as we are inserting a 0 source that might
+    /// conflict with other FAUs (in v9-v10).
+    pub fn opt_exec_units(&mut self) {
+        for instr in self.blocks.iter_mut().flat_map(|block| &mut block.instrs) {
+            translate_instr(instr);
+        }
         let masks = BooleanMasks::for_shader(self);
         let aliases: FxHashMap<_, _> = self.blocks.iter()
             .flat_map(|block| &block.instrs)
             .filter_map(|instr| boolean_alias(instr, &masks))
             .map(|(ssa, src, invert)| (ssa, (src, invert))).collect();
         let mut progress = false;
-        for block in self.blocks.iter_mut() {
-            let mut comparisons = FxHashMap::default();
-            let mut zero_users: Vec<usize> = Vec::new();
-            for (ip, instr) in block.instrs.iter_mut().enumerate() {
-                translate_instr(instr);
-                if let Op::Branch(op) = &mut instr.op {
-                    progress |= fold_branch_condition(op, &aliases, &masks);
-                }
-                if let Op::CSel(op) = &instr.op {
-                    if let Some(ssa) = select_predicate(op) {
-                        if let Some(cmp) = comparisons.get(&ssa) {
-                            let cmp: &Comparison = cmp;
-                            if let Some(merged) = cmp.merge_select(op, model) {
-                                instr.op = merged;
-                                progress = true;
-                            }
-                        }
-                    }
-                }
-                if !zero_free {
-                    if let Op::CSel(op) = &instr.op {
-                        if csel_zero_reg_helps(op) {
-                            zero_users.push(ip);
-                        }
-                    }
-                }
-                if instr.flow == FlowCtrl::NONE {
-                    if let Op::ShiftLop(op) = &instr.op {
-                        if let Some(inputs) = accum_inputs(op) {
-                            let merged = inputs.into_iter().find_map(|(src, accum)| {
-                                let ssa = plain_scalar_ssa(src)?;
-                                if !masks.contains(accum) {
-                                    return None;
-                                }
-                                let cmp = comparisons.get(&ssa)?;
-                                cmp.merge_accum(op, accum, model)
-                            });
-                            if let Some(merged) = merged {
-                                instr.op = merged;
-                                progress = true;
-                            }
-                        }
-                    }
-                }
-                if let Some((ssa, cmp)) = Comparison::from_instr(instr) {
-                    if uses.get(&ssa) == Some(&1) {
-                        comparisons.insert(ssa, cmp);
-                    }
-                }
-            }
-            if zero_users.len() >= 2 {
-                let zero = self.ssa_alloc.alloc_ssa(32);
-                for &ip in &zero_users {
-                    if let Op::CSel(op) = &mut block.instrs[ip].op {
-                        op.cmp_srcs[1] = SSARef::from(zero).into();
-                    }
-                }
-                block.instrs.insert(
-                    zero_users[0],
-                    OpCopy {
-                        dst: SSARef::from(zero).into(),
-                        dst_type: DataType::I32,
-                        src: 0_u32.into(),
-                    }
-                    .into(),
-                );
+        for instr in self.blocks.iter_mut().flat_map(|block| &mut block.instrs) {
+            if let Op::Branch(op) = &mut instr.op {
+                progress |= fold_branch_condition(op, &aliases, &masks);
             }
         }
+        progress |= self.fold_compares(&masks, false);
+        progress |= self.fold_minmax3();
         if progress {
             self.opt_dce();
+        }
+    }
+
+    pub fn opt_share_csel_zero(&mut self) {
+        if !self.model.fau().is_zero_free {
+            self.share_csel_zero();
         }
     }
 }

@@ -15,4 +15,10 @@ bool panvk_nir_lower_cooperative_matrix(nir_shader *nir,
 bool panvk_nir_lower_tile_image(nir_shader *nir, uint32_t *color_read_out,
                                 bool *z_read_out, bool *s_read_out);
 
+bool panvk_nir_fold_passthrough_gs(nir_shader *producer, const nir_shader *gs);
+
+nir_shader *panvk_nir_create_polygon_mode_gs(
+   const nir_shader_compiler_options *options, const nir_shader *producer,
+   bool points);
+
 #endif

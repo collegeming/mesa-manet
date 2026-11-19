@@ -11,6 +11,7 @@
 #include "util/os_time.h"
 #include "util/simple_mtx.h"
 #include "util/u_atomic.h"
+#include "util/u_debug.h"
 #include "vk_alloc.h"
 #include "vk_log.h"
 
@@ -137,6 +138,7 @@ rt_pipeline_destroy(struct vk_device *device, struct vk_pipeline *vk_pipeline,
    for (uint32_t i = 0; i < pipeline->stage_count; i++)
       ralloc_free(pipeline->stages[i].nir);
    vk_free2(&device->alloc, alloc, pipeline->stage_stack_sizes);
+   vk_free2(&device->alloc, alloc, pipeline->stage_entry_offsets);
    vk_free2(&device->alloc, alloc, pipeline->stages);
    vk_free2(&device->alloc, alloc, pipeline->groups);
    if (pipeline->layout)
@@ -252,6 +254,39 @@ rt_group_stage_matches(const struct panvk_rt_pipeline *pipeline, uint32_t index,
            pipeline->stages[index].stage == stage);
 }
 
+static VkResult
+rt_group_capture_replay(struct panvk_rt_pipeline *pipeline,
+                        struct panvk_rt_pipeline_group *group,
+                        const VkRayTracingShaderGroupCreateInfoKHR *info)
+{
+   struct mesa_blake3 hash;
+   _mesa_blake3_init(&hash);
+   _mesa_blake3_update(&hash, &info->type, sizeof(info->type));
+   const uint32_t indices[] = {info->generalShader, info->intersectionShader,
+                               info->anyHitShader, info->closestHitShader};
+   simple_mtx_lock(&stage_ids_mutex);
+   for (unsigned i = 0; i < ARRAY_SIZE(indices); i++) {
+      uint32_t present = indices[i] != VK_SHADER_UNUSED_KHR;
+      _mesa_blake3_update(&hash, &present, sizeof(present));
+      if (!present)
+         continue;
+      uint32_t id = pipeline->stages[indices[i]].id;
+      struct rt_stage_identity *entry = stage_ids;
+      while (entry && entry->id != id)
+         entry = entry->next;
+      assert(entry);
+      _mesa_blake3_update(&hash, entry->hash, sizeof(entry->hash));
+   }
+   simple_mtx_unlock(&stage_ids_mutex);
+   group->capture_replay.handle = group->handle;
+   _mesa_blake3_final(&hash, group->capture_replay.hash);
+   if (info->pShaderGroupCaptureReplayHandle &&
+       memcmp(info->pShaderGroupCaptureReplayHandle, &group->capture_replay,
+              sizeof(group->capture_replay)))
+      return VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+   return VK_SUCCESS;
+}
+
 VkResult
 panvk_per_arch(rt_pipeline_group_init)(struct panvk_rt_pipeline *pipeline,
               struct panvk_rt_pipeline_group *group,
@@ -260,9 +295,6 @@ panvk_per_arch(rt_pipeline_group_init)(struct panvk_rt_pipeline *pipeline,
    group->info = *info;
    group->info.pNext = NULL;
    group->info.pShaderGroupCaptureReplayHandle = NULL;
-
-   if (info->pShaderGroupCaptureReplayHandle)
-      return VK_ERROR_FEATURE_NOT_PRESENT;
 
    if (info->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR) {
       if (info->closestHitShader != VK_SHADER_UNUSED_KHR ||
@@ -285,7 +317,7 @@ panvk_per_arch(rt_pipeline_group_init)(struct panvk_rt_pipeline *pipeline,
       }
       panvk_rt_shader_group_init_general(&group->handle, &group->stack_sizes,
                                          id, 0, stack);
-      return VK_SUCCESS;
+      return rt_group_capture_replay(pipeline, group, info);
    }
 
    if (info->type != VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR &&
@@ -316,6 +348,33 @@ panvk_per_arch(rt_pipeline_group_init)(struct panvk_rt_pipeline *pipeline,
    panvk_rt_shader_group_init_hit(&group->handle, &group->stack_sizes,
                                  ids[0], stacks[0], ids[1], stacks[1],
                                  ids[2], stacks[2]);
+   return rt_group_capture_replay(pipeline, group, info);
+}
+
+static VkResult
+rt_replay_stage_id(const VkRayTracingPipelineCreateInfoKHR *info,
+                    uint32_t stage, uint32_t *id)
+{
+   *id = 0;
+   for (uint32_t i = 0; i < info->groupCount; i++) {
+      const VkRayTracingShaderGroupCreateInfoKHR *group = &info->pGroups[i];
+      if (!group->pShaderGroupCaptureReplayHandle)
+         continue;
+      struct panvk_rt_capture_replay_handle replay;
+      memcpy(&replay, group->pShaderGroupCaptureReplayHandle, sizeof(replay));
+      uint32_t primary = group->type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR
+                            ? group->generalShader : group->intersectionShader;
+      uint32_t indices[] = {primary, group->anyHitShader, group->closestHitShader};
+      uint64_t ids[] = {replay.handle.general_or_intersection,
+                        replay.handle.any_hit, replay.handle.closest_hit};
+      for (unsigned s = 0; s < ARRAY_SIZE(indices); s++) {
+         if (indices[s] != stage)
+            continue;
+         if (!ids[s] || ids[s] > INT32_MAX || (*id && *id != ids[s]))
+            return VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+         *id = ids[s];
+      }
+   }
    return VK_SUCCESS;
 }
 
@@ -369,8 +428,7 @@ rt_pipeline_create(struct panvk_device *dev,
                    const VkAllocationCallbacks *alloc, VkPipeline *handle)
 {
    VkPipelineCreateFlags2KHR flags = vk_rt_pipeline_create_flags(info);
-   if (flags & (VK_PIPELINE_CREATE_2_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR |
-                VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT))
+   if (flags & VK_PIPELINE_CREATE_2_DESCRIPTOR_HEAP_BIT_EXT)
       return VK_ERROR_FEATURE_NOT_PRESENT;
 
    const VkPipelineBinaryInfoKHR *binary_info =
@@ -479,7 +537,15 @@ rt_pipeline_create(struct panvk_device *dev,
          &dev->vk, flags, stage_info, &spirv_options, nir_options, NULL, &nir);
       if (result != VK_SUCCESS)
          goto fail;
-      uint32_t id = rt_stage_id_alloc();
+      uint32_t id;
+      result = rt_replay_stage_id(info, i, &id);
+      if (result != VK_SUCCESS) {
+         ralloc_free(nir);
+         goto fail;
+      }
+      bool replay = id != 0;
+      if (!id)
+         id = rt_stage_id_alloc();
       if (!id) {
          ralloc_free(nir);
          result = VK_ERROR_TOO_MANY_OBJECTS;
@@ -489,8 +555,14 @@ rt_pipeline_create(struct panvk_device *dev,
          (struct panvk_nir_rt_pipeline_stage){
             .nir = nir, .stage = stage, .id = id,
          };
-      result = panvk_per_arch(rt_stage_import)(
-         nir, &pipeline->stages[pipeline->stage_count - 1].id);
+      if (replay) {
+         result = panvk_per_arch(rt_stage_register)(nir, id);
+         if (result == VK_ERROR_UNKNOWN)
+            result = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+      } else {
+         result = panvk_per_arch(rt_stage_import)(
+            nir, &pipeline->stages[pipeline->stage_count - 1].id);
+      }
       if (result != VK_SUCCESS)
          goto fail;
       pipeline->registered_stage_count++;
@@ -576,13 +648,23 @@ rt_pipeline_create(struct panvk_device *dev,
       .max_recursion_depth = pipeline->max_recursion_depth,
       .max_hit_attribute_size = pipeline->max_hit_attribute_size,
       .flags = flags,
+      .native = pan_use_kraid(PAN_ARCH, MESA_SHADER_COMPUTE, false) &&
+                debug_get_bool_option("PANVK_NATIVE_RT", true),
+      .disable_lto = !debug_get_bool_option("PANVK_NATIVE_RT_LTO", true),
+      .tls = debug_get_bool_option("PANVK_NATIVE_RT_TLS", true),
+      .direct_handles =
+         !(info->pLibraryInfo && info->pLibraryInfo->libraryCount) &&
+         !(flags & (VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR |
+                    VK_PIPELINE_CREATE_2_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR)),
    };
+retry_link:
+   pipeline->native_direct_sbt = link_info.native && link_info.direct_handles;
+   pipeline->native_tls = link_info.native && link_info.tls;
    result = panvk_nir_rt_pipeline_create(link_ctx, &link_info, &linked);
-   if (result != VK_SUCCESS) {
-      ralloc_free(link_ctx);
-      goto fail;
-   }
+   if (result != VK_SUCCESS)
+      goto finish_link;
    pipeline->frame_size = linked.frame_size;
+   pipeline->external_frame_size = linked.external_frame_size;
    pipeline->compiled_stack_size = linked.stack_size;
    memcpy(pipeline->stage_stack_sizes, linked.per_stage_stack_size,
           pipeline->stage_count * sizeof(*pipeline->stage_stack_sizes));
@@ -590,10 +672,8 @@ rt_pipeline_create(struct panvk_device *dev,
       VkRayTracingShaderGroupCreateInfoKHR group_info = pipeline->groups[i].info;
       result = panvk_per_arch(rt_pipeline_group_init)(
          pipeline, &pipeline->groups[i], &group_info);
-      if (result != VK_SUCCESS) {
-         ralloc_free(link_ctx);
-         goto fail;
-      }
+      if (result != VK_SUCCESS)
+         goto finish_link;
    }
    pipeline->stack_size = pipeline->stack_size_dynamic ? 0 :
       panvk_per_arch(rt_pipeline_default_stack_size)(pipeline);
@@ -602,12 +682,80 @@ rt_pipeline_create(struct panvk_device *dev,
       nir_shader *nir = linked.nir;
       ralloc_steal(NULL, nir);
       result = panvk_per_arch(rt_compile_nir)(
-         dev, nir, pipeline->layout, &pipeline->robustness, flags, alloc,
-         &pipeline->shader);
+         dev, nir, pipeline->layout, &pipeline->robustness, flags,
+         linked.ray_query_slots, alloc, &pipeline->shader);
    }
+   if (result == VK_SUCCESS && link_info.native) {
+      struct panvk_shader **functions = calloc(pipeline->stage_count, sizeof(*functions));
+      if (!functions) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      } else {
+         for (unsigned i = 0; i < pipeline->stage_count && result == VK_SUCCESS; i++) {
+            ralloc_steal(NULL, linked.functions[i]);
+            result = panvk_per_arch(rt_compile_nir)(
+               dev, linked.functions[i], pipeline->layout, &pipeline->robustness,
+               flags, linked.ray_query_slots, alloc, &functions[i]);
+         }
+         if (result == VK_SUCCESS) {
+            if (pipeline->shader) {
+               result = panvk_per_arch(rt_link_native_shaders)(dev, pipeline, functions, alloc);
+            } else {
+               uint32_t saved = 16;
+               for (unsigned i = 0; i < pipeline->stage_count; i++) {
+                  saved = MAX2(saved, functions[i]->variants[0].info.rt_frame_size);
+                  pipeline->stage_stack_sizes[i] = functions[i]->variants[0].info.rt_frame_size;
+               }
+               pipeline->native_frame_stride = saved;
+               pipeline->compiled_stack_size = 0;
+            }
+         }
+         for (unsigned i = 0; i < pipeline->stage_count; i++) {
+            if (functions[i])
+               vk_shader_destroy(&dev->vk, &functions[i]->vk, alloc);
+         }
+         free(functions);
+      }
+   }
+finish_link:
    ralloc_free(link_ctx);
+   if (result != VK_SUCCESS && link_info.native &&
+       result != VK_ERROR_OUT_OF_HOST_MEMORY &&
+       result != VK_PIPELINE_COMPILE_REQUIRED) {
+      if (pipeline->shader) {
+         vk_shader_destroy(&dev->vk, &pipeline->shader->vk, alloc);
+         pipeline->shader = NULL;
+      }
+      vk_free2(&dev->vk.alloc, alloc, pipeline->stage_entry_offsets);
+      pipeline->stage_entry_offsets = NULL;
+      pipeline->native_frame_stride = 0;
+      pipeline->native_tls_offset = 0;
+      link_info.native = false;
+      link_info.direct_handles = false;
+      link_ctx = ralloc_context(NULL);
+      if (!link_ctx) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
+         goto fail;
+      }
+      goto retry_link;
+   }
    if (result != VK_SUCCESS)
       goto fail;
+
+   if (pipeline->native_frame_stride) {
+      for (unsigned i = 0; i < pipeline->group_count; i++) {
+         VkRayTracingShaderGroupCreateInfoKHR group_info = pipeline->groups[i].info;
+         result = panvk_per_arch(rt_pipeline_group_init)(pipeline, &pipeline->groups[i], &group_info);
+         if (result != VK_SUCCESS)
+            goto fail;
+      }
+      pipeline->compiled_stack_size = pipeline->frame_size +
+         panvk_per_arch(rt_pipeline_default_stack_size)(pipeline);
+      if (pipeline->compiled_stack_size > UINT32_MAX - pipeline->native_tls_offset) {
+         result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+         goto fail;
+      }
+      pipeline->stack_size = pipeline->stack_size_dynamic ? 0 : pipeline->compiled_stack_size;
+   }
 
    *handle = panvk_rt_pipeline_to_handle(pipeline);
    return VK_SUCCESS;
@@ -673,9 +821,30 @@ panvk_per_arch(GetRayTracingShaderGroupHandlesKHR)(
        dataSize < (uint64_t)groupCount * PANVK_RT_SHADER_GROUP_HANDLE_SIZE)
       return VK_ERROR_UNKNOWN;
    for (uint32_t i = 0; i < groupCount; i++) {
+      const struct panvk_rt_pipeline_group *group = &pipeline->groups[firstGroup + i];
+      struct panvk_rt_shader_group_handle handle = group->handle;
+      if (pipeline->native_direct_sbt) {
+         uint32_t stages[] = {
+            group->info.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR ?
+               group->info.generalShader : group->info.intersectionShader,
+            group->info.anyHitShader,
+            group->info.closestHitShader,
+         };
+         uint64_t addresses[3] = {0};
+         handle.pilot = panvk_rt_native_shader_indices(stages, pipeline->stage_count);
+         uint64_t base = panvk_shader_variant_get_dev_addr(&pipeline->shader->variants[0]);
+         for (unsigned j = 0; j < ARRAY_SIZE(stages); j++) {
+            if (stages[j] != VK_SHADER_UNUSED_KHR) {
+               addresses[j] = (uint32_t)(base + pipeline->stage_entry_offsets[stages[j]]) |
+                  (uint64_t)pipeline->stage_stack_sizes[stages[j]] << 32;
+            }
+         }
+         handle.general_or_intersection = addresses[0];
+         handle.any_hit = addresses[1];
+         handle.closest_hit = addresses[2];
+      }
       memcpy((uint8_t *)pData + (size_t)i * PANVK_RT_SHADER_GROUP_HANDLE_SIZE,
-             &pipeline->groups[firstGroup + i].handle,
-             PANVK_RT_SHADER_GROUP_HANDLE_SIZE);
+             &handle, sizeof(handle));
    }
    return VK_SUCCESS;
 }
@@ -699,10 +868,16 @@ panvk_per_arch(GetRayTracingCaptureReplayShaderGroupHandlesKHR)(
    uint32_t groupCount, size_t dataSize, void *pData)
 {
    (void)device;
-   (void)pipelineHandle;
-   (void)firstGroup;
-   (void)groupCount;
-   (void)dataSize;
-   (void)pData;
-   return VK_ERROR_FEATURE_NOT_PRESENT;
+   VK_FROM_HANDLE(panvk_rt_pipeline, pipeline, pipelineHandle);
+   if (!pipeline ||
+       !(pipeline->vk.flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR) ||
+       firstGroup > pipeline->group_count ||
+       groupCount > pipeline->group_count - firstGroup ||
+       dataSize < (uint64_t)groupCount * sizeof(struct panvk_rt_capture_replay_handle))
+      return VK_ERROR_UNKNOWN;
+   for (uint32_t i = 0; i < groupCount; i++)
+      memcpy((uint8_t *)pData + (size_t)i * sizeof(struct panvk_rt_capture_replay_handle),
+             &pipeline->groups[firstGroup + i].capture_replay,
+             sizeof(struct panvk_rt_capture_replay_handle));
+   return VK_SUCCESS;
 }

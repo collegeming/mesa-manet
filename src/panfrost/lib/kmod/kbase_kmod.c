@@ -520,10 +520,17 @@ kbase_kmod_get_flush_id(const struct pan_kmod_dev *dev)
 int
 kbase_kmod_csf_group_create(struct pan_kmod_dev *dev, uint32_t cs_queue_count,
                             bool tiler_oom_handler, uint32_t max_cores,
+                            uint64_t dvs_buf, bool compute_priority,
                             uint32_t *group_handle)
 {
    STATIC_ASSERT(sizeof(union kbase_ioctl_cs_queue_group_create_1_18) == 40);
    STATIC_ASSERT(sizeof(union kbase_ioctl_cs_queue_group_create) == 120);
+
+   /* The kbase uAPI versions we drive (1.6/1.18/1.19) have no DVS buffer
+    * or compute-priority group fields; the transport accepts the arguments
+    * from the manet callers but derives the same request as before. */
+   if (dvs_buf || compute_priority)
+      mesa_logd("kbase: ignoring dvs_buf/compute_priority on this transport");
 
    /* Heap growth is handled by the kernel until max_chunks is reached. The
     * kernel only permits the firmware to invoke our incremental-rendering
@@ -625,6 +632,67 @@ kbase_kmod_csf_group_create(struct pan_kmod_dev *dev, uint32_t cs_queue_count,
 
    *group_handle = req.out.group_handle;
    return 0;
+}
+
+int
+kbase_kmod_csf_group_create_with_uid(struct pan_kmod_dev *dev,
+                                     uint32_t cs_queue_count,
+                                     bool tiler_oom_handler, uint32_t max_cores,
+                                     uint64_t dvs_buf, bool compute_priority,
+                                     uint32_t *group_handle,
+                                     uint32_t *group_uid)
+{
+   /* The uAPI versions we drive do not return a CSG UID; the group handle
+    * is a unique identity on this transport, so alias the UID to it. */
+   int ret = kbase_kmod_csf_group_create(dev, cs_queue_count, tiler_oom_handler,
+                                         max_cores, dvs_buf, compute_priority,
+                                         group_handle);
+   if (ret == 0 && group_uid)
+      *group_uid = *group_handle;
+   return ret;
+}
+
+int
+kbase_kmod_csf_group_create_with_neural(struct pan_kmod_dev *dev,
+                                        uint32_t cs_queue_count,
+                                        bool tiler_oom_handler,
+                                        uint32_t max_cores,
+                                        uint64_t dvs_buf, bool compute_priority,
+                                        bool neural, uint32_t *group_handle,
+                                        uint32_t *group_uid)
+{
+   /* This platform's kbase transport has no neural core in the uAPI we
+    * drive.  Callers gate on kbase_kmod_csf_has_neural() and take the
+    * plain path; complain loudly if the gate is ever bypassed so the
+    * fallback cannot fail silently. */
+   if (neural)
+      mesa_logw("kbase: neural group requested but this transport has none; "
+                "creating a regular CSG");
+
+   return kbase_kmod_csf_group_create_with_uid(dev, cs_queue_count,
+                                               tiler_oom_handler, max_cores,
+                                               dvs_buf, compute_priority,
+                                               group_handle, group_uid);
+}
+
+bool
+kbase_kmod_csf_has_neural(const struct pan_kmod_dev *dev)
+{
+   return false;
+}
+
+uint32_t
+kbase_kmod_csf_neural_core_count(const struct pan_kmod_dev *dev)
+{
+   return 0;
+}
+
+bool
+kbase_kmod_get_l2_cache_props(const struct pan_kmod_dev *dev,
+                              struct kbase_kmod_l2_cache_props *props)
+{
+   /* The uAPI versions we drive expose no L2 cache property query. */
+   return false;
 }
 
 static void
@@ -1164,19 +1232,19 @@ kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
                                  uint32_t chunk_size, uint32_t initial_chunks,
                                  uint32_t max_chunks,
                                  uint32_t target_in_flight,
-                                 uint32_t mem_group_id,
                                  uint64_t *heap_ctx_va,
                                  uint64_t *first_chunk_va)
 {
    /* The uAPI group_id is the physical memory group used for allocations,
-    * not the CS queue group handle. */
+    * not the CS queue group handle.  The manet callers no longer pass one:
+    * this platform exposes a single memory group, so default to group 0. */
    union kbase_ioctl_cs_tiler_heap_init req = {
       .in = {
          .chunk_size = chunk_size,
          .initial_chunks = initial_chunks,
          .max_chunks = max_chunks,
          .target_in_flight = MIN2(target_in_flight, UINT16_MAX),
-         .group_id = mem_group_id,
+         .group_id = 0,
       },
    };
 
@@ -1751,6 +1819,25 @@ kbase_kmod_bo_alloc_dmabuf(struct pan_kmod_dev *dev, uint64_t size,
    return bo;
 }
 
+/* manet's opaque-address capture allocation.  The uAPI we drive has no
+ * fixed-VA import path; refuse anything that actually needs one and
+ * forward the rest to the regular allocator (CAPTURE_REPLAY is silently
+ * dropped by to_kbase_mem_flags). */
+static struct pan_kmod_bo *
+kbase_kmod_bo_alloc_at(struct pan_kmod_dev *dev,
+                       struct pan_kmod_vm *exclusive_vm, uint64_t size,
+                       uint32_t kmod_flags, uint64_t va)
+{
+   if (va) {
+      mesa_loge("kbase: fixed-VA BO allocation (va=%#" PRIx64
+                ") is unsupported on this transport", va);
+      errno = EINVAL;
+      return NULL;
+   }
+
+   return kbase_kmod_bo_alloc(dev, exclusive_vm, size, kmod_flags);
+}
+
 static struct pan_kmod_bo *
 kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
                     struct pan_kmod_vm *exclusive_vm, uint64_t size,
@@ -2208,4 +2295,7 @@ const struct pan_kmod_ops kbase_kmod_ops = {
    .vm_query_state         = kbase_kmod_vm_query_state,
    .query_timestamp        = kbase_kmod_query_timestamp,
    .bo_set_label           = kbase_kmod_bo_set_label,
+   /* manet captures nothing on this transport: bo_alloc_at only serves
+    * the va==0 / non-CAPTURE_REPLAY requests and defers to bo_alloc. */
+   .bo_alloc_at            = kbase_kmod_bo_alloc_at,
 };

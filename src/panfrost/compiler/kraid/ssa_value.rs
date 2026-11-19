@@ -465,7 +465,7 @@ pub trait AllocSSA {
 /// This is the only valid way to create SSAValues.  At most one SSA value
 /// allocator may exist per shader to ensure the invariant that SSA value
 /// indices are unique.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SSAValueAllocator {
     meta: Vec<SSAValueMeta>,
 }

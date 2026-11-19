@@ -99,6 +99,14 @@ panlib_tess_setup_indirect(
 }
 
 KERNEL(256)
+panlib_prefix_sum_gs(global uint32_t *counts, uint32_t len)
+{
+   local uint scratch[32];
+
+   poly_prefix_sum(scratch, counts, len, 1, 0, 256);
+}
+
+KERNEL(256)
 panlib_prefix_sum_tess(global struct poly_tess_params *p)
 {
    local uint scratch[32];

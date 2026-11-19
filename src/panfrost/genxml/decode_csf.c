@@ -179,7 +179,16 @@ print_cs_instr(FILE *fp, const uint64_t *instr)
    }
 
    case MALI_CS_OPCODE_RUN_COMPUTE: {
-      const char *axes[4] = {"x_axis", "y_axis", "z_axis"};
+      static const char *axes[4] = {
+         [MALI_TASK_AXIS_X] = "x_axis",
+         [MALI_TASK_AXIS_Y] = "y_axis",
+         [MALI_TASK_AXIS_Z] = "z_axis",
+#if PAN_ARCH >= 15
+         [MALI_TASK_AXIS_INFERRED] = "inferred_axis",
+#else
+         [MALI_TASK_AXIS_Z + 1] = "invalid_axis",
+#endif
+      };
       cs_unpack(instr, CS_RUN_COMPUTE, I);
       assert_no_progress_inc(I);
 
@@ -521,11 +530,26 @@ print_cs_instr(FILE *fp, const uint64_t *instr)
       break;
    }
 
+#if PAN_ARCH >= 15
+   case MALI_CS_OPCODE_RUN_NEURAL: {
+      cs_unpack(instr, CS_RUN_NEURAL, I);
+      fprintf(fp, "RUN_NEURAL r%u, #%u, #%u", I.base_register, I.icnt,
+              I.staging_count);
+      break;
+   }
+#endif
+
    case MALI_CS_OPCODE_REQ_RESOURCE: {
       cs_unpack(instr, CS_REQ_RESOURCE, I);
       fprintf(fp, "REQ_RESOURCE%s%s%s%s", I.compute ? ".compute" : "",
               I.fragment ? ".fragment" : "", I.tiler ? ".tiler" : "",
               I.idvs ? ".idvs" : "");
+#if PAN_ARCH >= 15
+      if (I.rt)
+         fputs(".rt", fp);
+      if (I.neural)
+         fputs(".neural", fp);
+#endif
       break;
    }
 

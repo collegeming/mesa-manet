@@ -144,6 +144,8 @@ index("int", "base")
 
 # For store instructions, a writemask for the store.
 index("unsigned", "write_mask")
+index("unsigned", "rt_arg_mask")
+index("unsigned", "rt_call_flags")
 
 # Same as write_mask, but can be 0 and still have side effects
 index("unsigned", "enabled_channels")
@@ -1780,6 +1782,11 @@ intrinsic("load_var_special_pan", src_comp=[1], dest_comp=0, bit_sizes=[32],
 intrinsic("load_shader_output_pan", dest_comp=1, src_comp=[], bit_sizes=[32],
           indices=[], flags=[CAN_REORDER, CAN_ELIMINATE])
 
+intrinsic("load_pilot_arg_pan", dest_comp=1, src_comp=[], bit_sizes=[64],
+          indices=[BASE], flags=[CAN_REORDER, CAN_ELIMINATE])
+
+intrinsic("jump_pilot_pan", src_comp=[1, 1, 1])
+
 # The hardware-native vertex ID and the associated offset such that
 #   vertex_id = raw_vertex_id + raw_vertex_offset
 # For a non-indexed draw the raw vertex ID is the zero-based position of the
@@ -1906,6 +1913,18 @@ intrinsic("lea_attr_pan", [1, 1, 1], dest_comp=3, bit_sizes=[32],
 intrinsic("lea_buf_pan", [1, 1], dest_comp=2, bit_sizes=[32],
           flags=[CAN_ELIMINATE, CAN_REORDER])
 
+intrinsic("load_rt_arg_pan", dest_comp=1, bit_sizes=[32, 64], indices=[BASE],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+intrinsic("rt_call_pan", src_comp=[1, 4, 8, 1, 1], indices=[BASE, RT_ARG_MASK, RT_CALL_FLAGS])
+intrinsic("rt_call_result_pan", src_comp=[1, 4, 8, 1, 1], dest_comp=0,
+          bit_sizes=[32], indices=[BASE, RT_ARG_MASK, RT_CALL_FLAGS])
+intrinsic("rt_return_pan", src_comp=[1, 1], indices=[BASE, STACK_SIZE])
+intrinsic("rt_return_value_pan", src_comp=[1, 1, 0], indices=[BASE, STACK_SIZE])
+intrinsic("load_rt_frame_size_pan", dest_comp=1, bit_sizes=[32],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+intrinsic("load_rt_tls_base_pan", dest_comp=1, bit_sizes=[64],
+          flags=[CAN_ELIMINATE, CAN_REORDER])
+
 intrinsic("rt_trace_begin_pan", [1, 1, 3, 3, 1, 1, 1, 1], dest_comp=2,
           bit_sizes=[32])
 
@@ -1939,6 +1958,8 @@ system_value("multisampled_pan", 1, bit_sizes=[32])
 # noperspective, this is 32 bits and starts from VARYING_SLOT_VAR0.
 system_value("noperspective_varyings_pan", 1, bit_sizes=[32])
 
+system_value("clip_cull_count_pan", 1, bit_sizes=[32])
+
 # Render area of the framebuffer.  Used by framebuffer load shaders.
 # The returned vector is (min_x, min_y, max_x, max_y)
 system_value("fb_render_area_pan", 4, bit_sizes=[16])
@@ -1949,6 +1970,7 @@ load("clear_value_pan", [], [IO_SEMANTICS, DEST_TYPE],
 
 # Frame argument parameter from the framebuffer descriptor
 system_value("frame_arg_pan", 1, bit_sizes=[64])
+system_value("primitive_flags_pan", 1, bit_sizes=[32])
 
 # Cumulative coverage mask, the start of the atest/zt/blend chain
 system_value("cumulative_coverage_pan", 1, bit_sizes=[32])
@@ -1969,7 +1991,7 @@ intrinsic("atest_pan", [1, 1], dest_comp=1, bit_sizes=[32])
 intrinsic("zs_emit_pan", [1, 1, 1], dest_comp=1,
           indices=[FLAGS], bit_sizes=[32])
 # src[] = { coverage, desc, color }
-intrinsic("blend_pan", [1, 1, 4], indices=[IO_SEMANTICS, SRC_TYPE])
+intrinsic("blend_pan", [1, 1, 0], indices=[IO_SEMANTICS, SRC_TYPE])
 # src[] = { coverage, desc, color1, color2 }
 intrinsic("blend2_pan", [1, 1, 4, 4],
           indices=[IO_SEMANTICS, SRC_TYPE, DEST_TYPE])

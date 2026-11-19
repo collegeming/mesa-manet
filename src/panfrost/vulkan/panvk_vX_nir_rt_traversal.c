@@ -1,5 +1,6 @@
 #include "panvk_nir_rt_traversal.h"
 #include "compiler/spirv/spirv.h"
+#include "bvh/panvk_bvh.h"
 
 #define RT_COMMITTED 0x24
 #define RT_CANDIDATE 0x64
@@ -27,6 +28,84 @@ static void
 rt_store(nir_builder *b, nir_def *addr, unsigned offset, nir_def *value)
 {
    nir_store_global(b, value, nir_iadd_imm(b, addr, offset), .align_mul = 4);
+}
+
+static nir_def *
+rt_blas_nodes(nir_builder *b, nir_def *as, nir_def *kind)
+{
+   nir_def *nodes = rt_load(b, as, offsetof(struct panvk_bvh_header, node_count), 1);
+   nir_def *instance = nir_iadd(b, nir_iadd_imm(b, as, PANVK_BVH_HEADER_SIZE),
+      nir_u2u64(b, nir_imul_imm(b, nir_iadd(b, nodes, nir_iand_imm(b, kind, 0xffffff)),
+                               PANVK_BVH_NODE_SIZE)));
+   nir_def *blas = nir_load_global(b, 1, 64,
+      nir_iadd_imm(b, instance, offsetof(struct panvk_bvh_instance_leaf, blas_ptr)),
+      .align_mul = 8);
+   return nir_iand_imm(b, blas, ~UINT64_C(0x800000000000003f));
+}
+
+static nir_def *
+rt_primitive_leaf(nir_builder *b, nir_def *nodes, nir_def *primitive)
+{
+   return nir_iadd(b, nodes,
+      nir_u2u64(b, nir_imul_imm(b, nir_ushr_imm(b, primitive, 2), PANVK_BVH_NODE_SIZE)));
+}
+
+static nir_def *
+rt_leaf_has_omm(nir_builder *b, nir_def *leaf)
+{
+   return nir_test_mask(b, rt_load(b, leaf,
+      offsetof(struct panvk_bvh_triangle_leaf, geometry_id_b), 1), 0x40000000);
+}
+
+nir_def *
+panvk_nir_rt_leaf_word(nir_builder *b, nir_def *as, nir_def *kind,
+                       nir_def *primitive, unsigned word)
+{
+   nir_def *nodes = rt_blas_nodes(b, as, kind);
+   nir_def *leaf = rt_primitive_leaf(b, nodes, primitive);
+   nir_def *omm = rt_leaf_has_omm(b, leaf);
+   nir_def *offset = nir_isub(b, nir_imm_int(b, word * 4),
+      nir_imul_imm(b, nir_iand_imm(b, primitive, 3), 4));
+   offset = nir_bcsel(b, omm, nir_imm_int(b, word * 4), offset);
+   nir_def *value = nir_load_global(b, 1, 32,
+      nir_iadd(b, leaf, nir_u2u64(b, offset)), .align_mul = 4);
+   if (word == 13) {
+      nir_push_if(b, omm);
+      nir_def *blas = nir_iadd_imm(b, nodes, -PANVK_BVH_HEADER_SIZE);
+      nir_def *count = rt_load(b, blas, offsetof(struct panvk_bvh_header, node_count), 1);
+      nir_def *table = nir_load_global(b, 1, 64,
+         nir_iadd_imm(b, blas, offsetof(struct panvk_bvh_header, omm_handles_offset)),
+         .align_mul = 8);
+      nir_def *index = nir_isub(b, nir_ushr_imm(b, primitive, 2), count);
+      nir_def *original = nir_load_global(b, 1, 32,
+         nir_iadd(b, nir_iadd(b, blas, table),
+                     nir_u2u64(b, nir_imul_imm(b, index, 4))), .align_mul = 4);
+      nir_pop_if(b, NULL);
+      value = nir_if_phi(b, original, value);
+   }
+   return value;
+}
+
+nir_def *
+panvk_nir_rt_triangle_vertex(nir_builder *b, nir_def *as, nir_def *kind,
+                              nir_def *primitive, unsigned vertex)
+{
+   assert(vertex < 3);
+   nir_def *leaf = rt_primitive_leaf(b, rt_blas_nodes(b, as, kind), primitive);
+   nir_def *omm = rt_leaf_has_omm(b, leaf);
+   nir_def *second = nir_iand(b, nir_inot(b, omm), nir_test_mask(b, primitive, 1));
+   nir_def *flags = rt_load(b, leaf,
+      offsetof(struct panvk_bvh_triangle_leaf, geometry_id_a_flags), 1);
+   nir_def *rotation = nir_iand_imm(b, nir_ushr(b, flags,
+      nir_bcsel(b, second, nir_imm_int(b, 28), nir_imm_int(b, 26))), 3);
+   rotation = nir_bcsel(b, nir_ieq_imm(b, rotation, 3), nir_imm_int(b, 1),
+      nir_bcsel(b, nir_ieq_imm(b, rotation, 2), nir_imm_int(b, 2), nir_imm_int(b, 0)));
+   rotation = nir_bcsel(b, omm, nir_imm_int(b, 0), rotation);
+   nir_def *index = nir_iadd_imm(b, rotation, vertex);
+   index = nir_bcsel(b, nir_uge_imm(b, index, 3), nir_iadd_imm(b, index, -3), index);
+   index = nir_bcsel(b, second, nir_isub(b, nir_imm_int(b, 3), index), index);
+   return nir_load_global(b, 3, 32,
+      nir_iadd(b, leaf, nir_u2u64(b, nir_imul_imm(b, index, 12))), .align_mul = 4);
 }
 
 static nir_def *

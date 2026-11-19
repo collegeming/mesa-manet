@@ -15,7 +15,7 @@
 #include "pan_image.h"
 #include "panvk_image_formats.h"
 
-#define PANVK_MAX_PLANES 3
+#include "panvk_descriptor_limits.h"
 
 struct panvk_device_memory;
 struct panvk_physical_device;
@@ -45,10 +45,17 @@ struct panvk_image {
 
    /* One image each for 2x 4x 8x 16x. We don't support more than 16x. */
    VkImage ms_imgs[4];
+   VkDeviceMemory ms_mem;
 
    /* If an image can track validity of CRC even when external access is
     * possible. */
    bool crc_safe_external;
+
+   bool block_copies;
+
+   VkFormat bc_emu_format;
+
+   bool yuv_swap_chroma;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_image, vk.base, VkImage,

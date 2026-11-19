@@ -22,6 +22,25 @@ fn alu_unit(model: &dyn Model, instr: &Instr) -> Option<ExecUnit> {
     }
 }
 
+fn is_texture(op: &Op) -> bool {
+    matches!(op, Op::TexDual(_) | Op::TexFetch(_) | Op::TexGather(_) | Op::TexGradient(_) | Op::TexSingle(_))
+}
+
+fn texture_handle(op: &Op) -> Option<&Src> {
+    match op {
+        Op::TexDual(op) => Some(&op.handle),
+        Op::TexFetch(op) => Some(&op.handle),
+        Op::TexGather(op) => Some(&op.handle),
+        Op::TexGradient(op) => Some(&op.handle),
+        Op::TexSingle(op) => Some(&op.handle),
+        _ => None,
+    }
+}
+
+fn same_texture(a: &Op, b: &Op) -> bool {
+    matches!((texture_handle(a), texture_handle(b)), (Some(x), Some(y)) if x == y)
+}
+
 fn halves(bytes: RegByteSet) -> Vec<usize> {
     let mut units: Vec<_> = bytes.iter().map(|byte| usize::from(byte / 2)).collect();
     units.dedup();
@@ -210,25 +229,137 @@ impl ScheduleState {
     }
 }
 
-fn refresh_last_use(model: &dyn Model, b: &mut BasicBlock, mut live: RegByteSet) {
-    for instr in b.instrs.iter_mut().rev() {
-        let access = RegAccess::for_instr(model, instr);
-        let retained = live - access.writes;
-        for src in instr.srcs_mut() {
-            src.last_use = match src.src_ref.as_reg() {
-                Some(reg) if matches!(reg.range, RegRange::Regs(_)) => {
-                    !reg.byte_range().any(|byte| retained.contains(byte))
-                }
-                _ => false,
-            };
-        }
-        live = access.live_before(live);
-    }
-}
-
 impl Shader<'_> {
+    pub fn hoist_message_loads(&mut self) {
+        if self.model.arch() != 15 {
+            return;
+        }
+        for b in self.blocks.iter_mut() {
+            let mut access: Vec<_> = b.instrs.iter()
+                .map(|instr| RegAccess::for_instr(self.model, instr)).collect();
+            for ip in 0..b.instrs.len() {
+                let instr = &b.instrs[ip];
+                if instr.flow != FlowCtrl::NONE
+                    || !matches!(
+                        instr.op,
+                        Op::Load(_) | Op::LdPka(_) | Op::LdChecked(_)
+                    )
+                {
+                    continue;
+                }
+                let load = access[ip];
+                let mut start = ip;
+                while start > 0 {
+                    let prev = start - 1;
+                    if alu_unit(self.model, &b.instrs[prev]).is_none()
+                        || !(load.reads & access[prev].writes).is_empty()
+                        || !(load.writes & access[prev].reads).is_empty()
+                        || !(load.writes & access[prev].writes).is_empty()
+                    {
+                        break;
+                    }
+                    start = prev;
+                }
+                if start != ip {
+                    b.instrs[start..=ip].rotate_right(1);
+                    access[start..=ip].rotate_right(1);
+                }
+            }
+        }
+    }
+
+    pub fn cluster_texture_messages(&mut self) {
+        if self.model.arch() != 15 {
+            return;
+        }
+        for b in self.blocks.iter_mut() {
+            let mut first = 0;
+            while first < b.instrs.len() {
+                if !is_texture(&b.instrs[first].op) || b.instrs[first].flow != FlowCtrl::NONE {
+                    first += 1;
+                    continue;
+                }
+                let mut second = first + 1;
+                while second < b.instrs.len() && alu_unit(self.model, &b.instrs[second]).is_some() {
+                    second += 1;
+                }
+                if second == b.instrs.len()
+                    || !same_texture(&b.instrs[first].op, &b.instrs[second].op)
+                {
+                    first = second;
+                    continue;
+                }
+                if second == first + 1 {
+                    first = second;
+                    continue;
+                }
+                let access: Vec<_> = b.instrs[first..=second].iter()
+                    .map(|instr| RegAccess::for_instr(self.model, instr)).collect();
+                let last = access.len() - 1;
+                let mut moved = vec![false; access.len()];
+                let mut need = access[last].reads;
+                for k in (1..last).rev() {
+                    if !(access[k].writes & need).is_empty() {
+                        moved[k] = true;
+                        need |= access[k].reads;
+                    }
+                }
+                let lead = access[0];
+                let tail = access[last];
+                let mut ok = true;
+                for k in 1..last {
+                    let a = access[k];
+                    if moved[k] {
+                        ok &= (a.writes & (lead.reads | lead.writes)).is_empty()
+                            && (a.reads & lead.writes).is_empty();
+                        for j in 1..k {
+                            if !moved[j] {
+                                ok &= (access[j].reads & a.writes).is_empty()
+                                    && (access[j].writes & (a.writes | a.reads)).is_empty();
+                            }
+                        }
+                    } else {
+                        ok &= (tail.writes & (a.reads | a.writes)).is_empty()
+                            && (tail.reads & a.writes).is_empty();
+                    }
+                }
+                if !ok {
+                    first = second;
+                    continue;
+                }
+                let mut order: Vec<usize> = (1..last).filter(|&k| moved[k]).collect();
+                let hoisted = order.len();
+                order.push(0);
+                order.push(last);
+                order.extend((1..last).filter(|&k| !moved[k]));
+                let mut old: Vec<Option<Instr>> = b.instrs.drain(first..=second).map(Some).collect();
+                let new: Vec<Instr> = order.iter().map(|&k| old[k].take().unwrap()).collect();
+                b.instrs.splice(first..first, new);
+                first += hoisted + 1;
+            }
+        }
+    }
+
+    pub fn mark_message_continue(&mut self) {
+        if self.model.arch() != 15 {
+            return;
+        }
+        for b in self.blocks.iter_mut() {
+            for ip in 1..b.instrs.len() {
+                if !same_texture(&b.instrs[ip - 1].op, &b.instrs[ip].op) {
+                    continue;
+                }
+                let mut flow = b.instrs[ip - 1].flow;
+                flow.take_msg_slot_idx();
+                if flow == FlowCtrl::NONE {
+                    b.instrs[ip - 1].flow.set_continue();
+                }
+            }
+        }
+    }
+
     pub fn schedule_after_ra(&mut self) {
-        if self.model.arch() != 10 {
+        if !matches!(self.model.arch(), 10 | 15) {
             return;
         }
         let physical = PhysicalLiveness::for_shader(self);
@@ -262,7 +393,6 @@ impl Shader<'_> {
             if changed {
                 let count = b.instrs.len();
                 unsafe { b.reorder_instrs(|ip| Some(old_to_new[ip]), count); }
-                refresh_last_use(self.model, b, physical.live_out[bi]);
             }
         }
     }
@@ -273,7 +403,10 @@ mod tests {
     use super::*;
     use crate::flow::FlowWaitBit;
     use crate::model::model_for_gpu_id;
-    use crate::ops::{OpFRcp, OpMov, OpNop};
+    use crate::ops::{BranchCombineOp, CmpOp, MemAccess, OpBarrier, OpDiscard,
+                     OpFRcp, OpJump, OpLdPka, OpLdVarSpecial, OpLoad, OpMov,
+                     OpNop, OpScheduleBarrier, OpStore, SamplePosition,
+                     VarSpecialName};
     use compiler::cfg::CFGBuilder;
     use rustc_hash::FxBuildHasher;
 
@@ -297,6 +430,155 @@ mod tests {
         cfg.add_node(0, BasicBlock { label: LabelAllocator::default().alloc(), instrs });
         Shader { model, ssa_alloc: Default::default(), phi_alloc: Default::default(),
                  blocks: cfg.as_cfg(false), info: ShaderInfo::default(), constant_pool: None }
+    }
+
+    fn load(dst: u8, addr: u8) -> Instr {
+        OpLoad { dst: RegRef::new(dst, RegRange::Regs(4)).into(),
+                 dst_type: DataType::I128, is_tls: false, access: MemAccess::None,
+                 addr: RegRef::new(addr, RegRange::Regs(2)).into(), offset: 0 }.into()
+    }
+
+    #[test]
+    fn message_loads_group_with_separate_deadlines() {
+        let model = model_for_gpu_id(0x0f080000f0000000, 4).unwrap();
+        let pka = OpLdPka { dst: RegRef::new(12, RegRange::Regs(4)).into(),
+                           dst_type: DataType::I128, access: MemAccess::Const,
+                           offset: 0_u32.into(), handle: reg(2).into() };
+        let mut s = shader(model.as_ref(), vec![load(4, 0), mov(8, 7), pka.into(),
+                                               mov(16, 15), load(20, 0), mov(24, 23)]);
+        s.hoist_message_loads();
+        assert!(matches!(s.blocks[0].instrs[0].op, Op::Load(_)));
+        assert!(matches!(s.blocks[0].instrs[1].op, Op::LdPka(_)));
+        assert!(matches!(s.blocks[0].instrs[2].op, Op::Load(_)));
+        s.assign_message_slots();
+        let instrs = &s.blocks[0].instrs;
+        assert_eq!(instrs[0].flow.get_msg_slot_idx(), Some(0));
+        assert_eq!(instrs[1].flow.get_msg_slot_idx(), Some(1));
+        assert_eq!(instrs[2].flow.get_msg_slot_idx(), Some(2));
+        assert_eq!(instrs[0].flow.wait, 0);
+        assert_eq!(instrs[1].flow.wait, 0);
+        assert!(instrs[2].flow.get_wait_bit(FlowWaitBit::Slot0));
+        assert!(!instrs[2].flow.get_wait_bit(FlowWaitBit::Slot2));
+        assert!(instrs[3].flow.get_wait_bit(FlowWaitBit::Slot1));
+        assert!(instrs[4].flow.get_wait_bit(FlowWaitBit::Slot2));
+    }
+
+    #[test]
+    fn message_load_hoist_preserves_register_hazards() {
+        let model = model_for_gpu_id(0x0f080000f0000000, 4).unwrap();
+        for prior in [mov(0, 30), mov(1, 30), mov(30, 7), mov(7, 30)] {
+            let mut s = shader(model.as_ref(), vec![prior, load(4, 0)]);
+            let before: Vec<_> = s.blocks[0].instrs.iter().map(ToString::to_string).collect();
+            s.hoist_message_loads();
+            let after: Vec<_> = s.blocks[0].instrs.iter().map(ToString::to_string).collect();
+            assert_eq!(before, after);
+        }
+        for range in [RegRange::Byte0, RegRange::Byte1, RegRange::Byte2,
+                      RegRange::Byte3, RegRange::Half0, RegRange::Half1] {
+            let partial = RegRef::new(7, range);
+            for prior in [Instr::from(OpMov { dst: partial.into(), dst_type: DataType::I32,
+                                             src: reg(30).into() }),
+                          Instr::from(OpMov { dst: reg(30).into(), dst_type: DataType::I32,
+                                             src: partial.into() })] {
+                let mut s = shader(model.as_ref(), vec![prior, load(4, 0)]);
+                s.hoist_message_loads();
+                assert!(matches!(s.blocks[0].instrs[0].op, Op::Mov(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn message_load_hoist_stops_at_execution_boundaries() {
+        let model = model_for_gpu_id(0x0f080000f0000000, 4).unwrap();
+        let mut flow = mov(30, 31);
+        flow.flow.set_wait_bit(FlowWaitBit::Slot0);
+        let boundaries = vec![
+            Instr::from(OpBarrier {}), Instr::from(OpScheduleBarrier {}), flow,
+            OpStore { src_type: DataType::I32, is_tls: false, is_psiz: false,
+                      access: MemAccess::None, data: reg(30).into(),
+                      addr: RegRef::new(32, RegRange::Regs(2)).into(), offset: 0 }.into(),
+            OpDiscard { cmp_op: CmpOp::Eq, srcs: [reg(30).into(), reg(31).into()] }.into(),
+            OpJump { not: false, cond: reg(30).into(), address: reg(31).into(),
+                     combine_op: BranchCombineOp::None }.into(),
+            OpLdVarSpecial { dst: reg(30).into(), dst_type: DataType::F32,
+                             src: reg(31).into(), name: VarSpecialName::FragW,
+                             sample_position: SamplePosition::Center,
+                             update: VaryingUpdateMode::Store }.into(),
+        ];
+        for boundary in boundaries {
+            let expected = boundary.to_string();
+            let mut s = shader(model.as_ref(), vec![mov(28, 29), boundary, mov(30, 31), load(4, 0)]);
+            s.hoist_message_loads();
+            assert_eq!(s.blocks[0].instrs[1].to_string(), expected);
+            assert!(matches!(s.blocks[0].instrs[2].op, Op::Load(_)));
+        }
+        let mut blocked = load(4, 0);
+        blocked.flow.set_wait_bit(FlowWaitBit::Slot1);
+        let mut s = shader(model.as_ref(), vec![mov(30, 31), blocked]);
+        s.hoist_message_loads();
+        assert!(matches!(s.blocks[0].instrs[0].op, Op::Mov(_)));
+    }
+
+    #[test]
+    fn message_load_hoist_is_v15_only() {
+        for arch in 9_u64..15 {
+            let model = model_for_gpu_id(arch << 28, 0).unwrap();
+            let mut s = shader(model.as_ref(), vec![load(4, 0), mov(8, 7), load(12, 0)]);
+            let before: Vec<_> = s.blocks[0].instrs.iter().map(ToString::to_string).collect();
+            s.hoist_message_loads();
+            let after: Vec<_> = s.blocks[0].instrs.iter().map(ToString::to_string).collect();
+            assert_eq!(before, after);
+        }
+    }
+
+    #[test]
+    fn randomized_load_hoists_preserve_physical_values() {
+        let model = model_for_gpu_id(0x0f080000f0000000, 4).unwrap();
+        let mut random = 0x9e3779b9_u32;
+        let mut next = || {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            random
+        };
+        let execute = |instrs: &[Instr], initial: [u32; 64]| {
+            let mut regs = initial;
+            for instr in instrs {
+                match &instr.op {
+                    Op::Mov(op) => {
+                        let src = op.src.src_ref.as_reg().unwrap();
+                        let dst = op.dst.dst_ref.as_reg().unwrap();
+                        regs[usize::from(dst.idx)] = regs[usize::from(src.idx)];
+                    }
+                    Op::Load(op) => {
+                        let addr = op.addr.src_ref.as_reg().unwrap();
+                        let dst = op.dst.dst_ref.as_reg().unwrap();
+                        let value = regs[usize::from(addr.idx)]
+                            .wrapping_add(regs[usize::from(addr.idx) + 1].rotate_left(13));
+                        for word in 0..4 {
+                            regs[usize::from(dst.idx) + word] = value.wrapping_mul(17 + word as u32);
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            regs
+        };
+        for _ in 0..2000 {
+            let mut initial = [0; 64];
+            for reg in &mut initial { *reg = next(); }
+            let mut instrs = Vec::new();
+            for _ in 0..40 {
+                let dst = (next() % 60) as u8;
+                let src = (next() % 62) as u8;
+                instrs.push(if next() % 3 == 0 { load(dst, src) } else { mov(dst, src) });
+            }
+            let expected = execute(&instrs, initial);
+            let mut s = shader(model.as_ref(), instrs);
+            s.hoist_message_loads();
+            assert_eq!(s.blocks[0].instrs.len(), 40);
+            assert_eq!(execute(&s.blocks[0].instrs, initial), expected);
+        }
     }
 
     #[test]
@@ -338,25 +620,6 @@ mod tests {
         state.clock = 4;
         assert!(state.forwarding(&dag.nodes[0]).is_empty());
         assert!(state.reuse(&dag.nodes[1]).is_empty());
-    }
-
-    #[test]
-    fn last_use_is_recomputed_with_partial_writes_and_live_out() {
-        let model = model_for_gpu_id(0xa0000000, 0).unwrap();
-        let mut instrs = vec![mov(2, 0), mov(3, 0), mov(0, 1), mov(4, 0)];
-        instrs[0].srcs_mut()[0].last_use = true;
-        instrs[2].dsts_mut()[0].lanes = DstLanes::H0;
-        let mut b = BasicBlock { label: LabelAllocator::default().alloc(), instrs };
-        let mut live = RegByteSet::new();
-        live.insert_range(0..4);
-        refresh_last_use(model.as_ref(), &mut b, live);
-        assert!(!b.instrs[0].srcs()[0].last_use);
-        assert!(!b.instrs[1].srcs()[0].last_use);
-        assert!(b.instrs[2].srcs()[0].last_use);
-        assert!(!b.instrs[3].srcs()[0].last_use);
-        refresh_last_use(model.as_ref(), &mut b, RegByteSet::new());
-        assert!(!b.instrs[1].srcs()[0].last_use);
-        assert!(b.instrs[3].srcs()[0].last_use);
     }
 
     #[test]

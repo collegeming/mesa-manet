@@ -407,10 +407,19 @@ static enum mali_pre_post_frame_shader_mode
 pan_fix_frame_shader_mode(enum mali_pre_post_frame_shader_mode mode,
                           bool force_clean_tile)
 {
-   if (force_clean_tile && mode == MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT)
-      return MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS;
-   else
+   if (!force_clean_tile)
       return mode;
+
+   switch (mode) {
+   case MALI_PRE_POST_FRAME_SHADER_MODE_INTERSECT:
+      return MALI_PRE_POST_FRAME_SHADER_MODE_ALWAYS;
+#if PAN_ARCH >= 13
+   case MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_INTERSECT:
+      return MALI_PRE_POST_FRAME_SHADER_MODE_PREPASS_ALWAYS;
+#endif
+   default:
+      return mode;
+   }
 }
 #endif
 

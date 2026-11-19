@@ -1915,6 +1915,11 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
       bi_mov_i32_to(b, dst, bi_preload(b, BI_PRELOAD_PRIMITIVE_ID));
       break;
 
+   case nir_intrinsic_load_frag_shading_rate:
+      bi_rshift_and_i32_to(b, dst, bi_preload(b, BI_PRELOAD_PRIMITIVE_FLAGS),
+                           bi_imm_u32(0xf), bi_imm_u8(8), false);
+      break;
+
    case nir_intrinsic_load_front_face: {
       /* (primitive_flags & 1) == 0 means primitive is front facing */
       bi_index primitive_facing = bi_preload(b, BI_PRELOAD_PRIMITIVE_FLAGS);
@@ -2100,6 +2105,10 @@ bi_emit_intrinsic(bi_builder *b, nir_intrinsic_instr *instr)
       assert(b->shader->arch >= 9);
       bi_collect_v2i32_to(b, dst, bi_preload(b, BI_PRELOAD_FRAME_ARG_LO),
                                   bi_preload(b, BI_PRELOAD_FRAME_ARG_HI));
+      break;
+
+   case nir_intrinsic_load_primitive_flags_pan:
+      bi_mov_i32_to(b, dst, bi_preload(b, BI_PRELOAD_PRIMITIVE_FLAGS));
       break;
 
    case nir_intrinsic_load_ssbo_address:

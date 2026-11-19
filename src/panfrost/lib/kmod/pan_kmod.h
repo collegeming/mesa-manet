@@ -96,7 +96,6 @@ struct pan_kmod_vm {
 
 /* Buffer object flags. */
 enum pan_kmod_bo_flags {
-   PAN_KMOD_BO_FLAG_SHARED_BACKING = BITFIELD_BIT(10),
    /* Allow GPU execution on this buffer. */
    PAN_KMOD_BO_FLAG_EXECUTABLE = BITFIELD_BIT(0),
 
@@ -145,6 +144,8 @@ enum pan_kmod_bo_flags {
     * caches the cross-core coherency protocol on every spill store.
     */
    PAN_KMOD_BO_FLAG_GPU_PRIVATE = BITFIELD_BIT(9),
+   PAN_KMOD_BO_FLAG_SHARED_BACKING = BITFIELD_BIT(10),
+   PAN_KMOD_BO_FLAG_CAPTURE_REPLAY = BITFIELD_BIT(11),
 };
 
 /* Allowed group priority flags. */
@@ -602,6 +603,9 @@ struct pan_kmod_ops {
 
    /* Destroy a perf session. */
    void (*perf_destroy)(struct pan_kmod_perf_session *session);
+   struct pan_kmod_bo *(*bo_alloc_at)(struct pan_kmod_dev *dev,
+                                    struct pan_kmod_vm *exclusive_vm,
+                                    uint64_t size, uint32_t flags, uint64_t va);
 };
 
 static inline bool
@@ -717,6 +721,9 @@ pan_kmod_dev_get_user_priv(struct pan_kmod_dev *dev)
 struct pan_kmod_bo *pan_kmod_bo_alloc(struct pan_kmod_dev *dev,
                                       struct pan_kmod_vm *exclusive_vm,
                                       uint64_t size, uint32_t flags);
+struct pan_kmod_bo *pan_kmod_bo_alloc_at(struct pan_kmod_dev *dev,
+                                        struct pan_kmod_vm *exclusive_vm,
+                                        uint64_t size, uint32_t flags, uint64_t va);
 
 static inline struct pan_kmod_bo *
 pan_kmod_bo_get(struct pan_kmod_bo *bo)

@@ -3,7 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#define kDefaultMaxIdBound kraidoc_spirv_default_max_id_bound
 #include <spirv-tools/libspirv.h>
+#undef kDefaultMaxIdBound
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -18,6 +20,7 @@
 #include "git_sha1.h"
 #include "nir.h"
 #include "vk_alloc.h"
+#include "vk_graphics_state.h"
 #include "vk_nir.h"
 #include "vk_util.h"
 
@@ -31,23 +34,30 @@
 #define DECLARE_ARCH(arch)                                                      \
    extern const struct vk_device_shader_ops panvk_v##arch##_offline_shader_ops; \
    VkResult panvk_v##arch##_compile_shader_offline(                             \
-      struct panvk_device *, struct vk_shader_compile_info *, bool,             \
+      struct panvk_device *, struct vk_shader_compile_info *,                   \
+      const struct vk_graphics_pipeline_state *, const uint32_t *, bool,        \
       struct vk_shader **);                                                     \
    VkResult panvk_v##arch##_CreateDescriptorSetLayout(                          \
       VkDevice, const VkDescriptorSetLayoutCreateInfo *,                        \
-      const VkAllocationCallbacks *, VkDescriptorSetLayout *)
+      const VkAllocationCallbacks *, VkDescriptorSetLayout *);                  \
+   unsigned panvk_v##arch##_offline_shader_variants(                            \
+      const struct vk_shader *, struct kraidoc_variant *, unsigned)
 
 DECLARE_ARCH(9);
 DECLARE_ARCH(10);
 DECLARE_ARCH(11);
+DECLARE_ARCH(15);
 
 struct arch_ops {
    const struct vk_device_shader_ops *frontend;
    VkResult (*compile)(struct panvk_device *, struct vk_shader_compile_info *,
-                       bool, struct vk_shader **);
+                       const struct vk_graphics_pipeline_state *,
+                       const uint32_t *, bool, struct vk_shader **);
    VkResult (*create_layout)(VkDevice, const VkDescriptorSetLayoutCreateInfo *,
                              const VkAllocationCallbacks *,
                              VkDescriptorSetLayout *);
+   unsigned (*variants)(const struct vk_shader *, struct kraidoc_variant *,
+                        unsigned);
 };
 
 struct binding {
@@ -61,7 +71,7 @@ struct options {
    uint64_t gpu_id;
    uint32_t gpu_variant, cores;
    int stage;
-   bool json, nir, preamble, legacy, detailed, list, info;
+   bool json, nir, preamble, legacy, detailed, list, info, pipeline;
    struct binding bindings[256];
    unsigned binding_count;
    VkSpecializationMapEntry specs[128];
@@ -167,6 +177,7 @@ descriptor_type(const char *str, VkDescriptorType *type)
       {"uniform-buffer-dynamic", VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC},
       {"storage-buffer-dynamic", VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC},
       {"input-attachment", VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT},
+      {"acceleration-structure", VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR},
    };
    for (unsigned i = 0; i < ARRAY_SIZE(types); i++)
       if (!strcmp(str, types[i].name)) {
@@ -396,6 +407,8 @@ reflect(nir_shader *nir, struct options *opts)
          type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
       else if (var->data.mode == nir_var_mem_ssbo)
          type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+      else if (var->data.resource_type == nir_resource_type_acceleration_structure)
+         type = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
       else if (glsl_type_is_image(base))
          type = (glsl_get_sampler_dim(base) == GLSL_SAMPLER_DIM_SUBPASS ||
                  glsl_get_sampler_dim(base) == GLSL_SAMPLER_DIM_SUBPASS_MS)
@@ -470,12 +483,12 @@ close_output(FILE *f)
 
 static bool
 dump_program(const struct options *opts, FILE *report, unsigned index,
-             const char *kind, const struct panvk_shader_variant *variant,
+             const char *kind, const struct kraidoc_program *program,
              unsigned offset, unsigned size, const struct pan_stats *stats,
              bool *comma)
 {
    char suffix[96], hash[BLAKE3_HEX_LEN];
-   const uint8_t *data = (const uint8_t *)variant->bin_ptr + offset;
+   const uint8_t *data = (const uint8_t *)program->bin + offset;
    hash_hex(data, size, hash);
    snprintf(suffix, sizeof(suffix), "%u.%s.isa.txt", index, kind);
    FILE *f = output_file(opts->prefix, suffix, "w");
@@ -494,18 +507,31 @@ dump_program(const struct options *opts, FILE *report, unsigned index,
    if (*comma)
       fputc(',', report);
    *comma = true;
+   const struct pan_fau_layout *fau = &program->info->fau;
+   char fau_map[PAN_MAX_PUSH + 1];
+   unsigned fau_words = MIN2(fau->count, PAN_MAX_PUSH);
+   for (unsigned w = 0; w < fau_words; w++) {
+      fau_map[w] = w < fau->reserved              ? 'D'
+                   : BITSET_TEST(fau->is_pilot, w) ? 'P'
+                   : BITSET_TEST(fau->is_const, w)
+                      ? (fau->words[w].constant ? 'C' : '0')
+                      : 'U';
+   }
+   fau_map[fau_words] = 0;
    fprintf(report,
            "{\"variant\":%u,\"kind\":\"%s\",\"instructions\":%u,"
            "\"spills\":%u,\"fills\":%u,\"work_reg_count\":%u,"
            "\"tls_size\":%u,\"wls_size\":%u,\"binary_bytes\":%u,"
-           "\"binary_blake3\":\"%s\"}",
+           "\"binary_blake3\":\"%s\",\"fau_reserved\":%u,"
+           "\"fau_count\":%u,\"fau_map\":\"%s\"}",
            index, kind, stats->valhall.instrs, stats->valhall.spills,
-           stats->valhall.fills, variant->info.work_reg_count,
-           variant->info.tls_size, variant->info.wls_size, size, hash);
+           stats->valhall.fills, program->info->work_reg_count,
+           program->info->tls_size, program->info->wls_size, size, hash,
+           fau->reserved, fau->count, fau_map);
    if (opts->legacy && !opts->json)
       printf("%u %s: %u instructions, %u registers, %u spills, %u fills, "
              "%u bytes\n",
-             index, kind, stats->valhall.instrs, variant->info.work_reg_count,
+             index, kind, stats->valhall.instrs, program->info->work_reg_count,
              stats->valhall.spills, stats->valhall.fills, size);
    return !ferror(report);
 }
@@ -527,12 +553,13 @@ write_context(FILE *report, const struct options *opts, const char *input_hash)
            "\"gpu_variant\":%u,\"shader_cores\":%u,"
            "\"subgroup_size\":16,\"preamble_enabled\":%s,"
            "\"compiler_flags\":%u,"
-           "\"abi\":\"PanVK\",\"graphics_state\":null,"
+           "\"abi\":\"PanVK\",\"graphics_state\":%s,"
            "\"robustness\":\"disabled\","
            "\"original_pipeline_state\":false,\"specialization\":[",
            _mesa_shader_stage_to_string(opts->stage), opts->gpu_id,
            opts->gpu_variant, opts->cores, opts->preamble ? "true" : "false",
-           pan_get_compiler_flags(pan_arch(opts->gpu_id)));
+           pan_get_compiler_flags(pan_arch(opts->gpu_id)),
+           opts->pipeline ? "\"static-default\"" : "null");
    for (unsigned i = 0; i < opts->spec_count; i++)
       fprintf(report, "%s{\"id\":%u,\"bytes\":%zu,\"bits\":\"0x%" PRIx64 "\"}",
               i ? "," : "", opts->specs[i].constantID, opts->specs[i].size,
@@ -558,7 +585,8 @@ write_report_context(FILE *f, const void *options, const char *input_hash)
 }
 
 static bool
-write_artifacts(const struct options *opts, struct panvk_shader *pan_shader,
+write_artifacts(const struct options *opts,
+                const struct kraidoc_variant *variants, unsigned count,
                 const char *input_hash)
 {
    if (!opts->prefix)
@@ -569,24 +597,23 @@ write_artifacts(const struct options *opts, struct panvk_shader *pan_shader,
    write_context(report, opts, input_hash);
    bool comma = false;
    bool ok = true;
-   panvk_shader_foreach_variant(pan_shader, variant) {
-      if (!variant->bin_size)
-         continue;
-      unsigned index = variant - pan_shader->variants;
-      unsigned split = variant->info.stage == MESA_SHADER_VERTEX
-                          ? variant->info.vs.secondary_offset
-                          : 0;
-      ok &= dump_program(opts, report, index, "main", variant, 0,
-                         split ? split : variant->bin_size,
-                         &variant->info.stats, &comma);
+   for (unsigned i = 0; i < count; i++) {
+      const struct kraidoc_variant *variant = &variants[i];
+      const struct pan_shader_info *info = variant->main.info;
+      unsigned index = variant->index;
+      unsigned split =
+         info->stage == MESA_SHADER_VERTEX ? info->vs.secondary_offset : 0;
+      ok &= dump_program(opts, report, index, "main", &variant->main, 0,
+                         split ? split : variant->main.size, &info->stats,
+                         &comma);
       if (split)
-         ok &= dump_program(opts, report, index, "varying", variant, split,
-                            variant->bin_size - split,
-                            &variant->info.stats_idvs_varying, &comma);
-      if (variant->preamble)
-         ok &= dump_program(opts, report, index, "pilot", variant->preamble, 0,
-                            variant->preamble->bin_size,
-                            &variant->preamble->info.stats, &comma);
+         ok &= dump_program(opts, report, index, "varying", &variant->main,
+                            split, variant->main.size - split,
+                            &info->stats_idvs_varying, &comma);
+      if (variant->pilot.info)
+         ok &= dump_program(opts, report, index, "pilot", &variant->pilot, 0,
+                            variant->pilot.size, &variant->pilot.info->stats,
+                            &comma);
       if (opts->nir && variant->nir_str) {
          char suffix[96];
          snprintf(suffix, sizeof(suffix), "%u.main.nir.txt", index);
@@ -615,6 +642,89 @@ write_artifacts(const struct options *opts, struct panvk_shader *pan_shader,
    return ok;
 }
 
+struct pipeline_state {
+   struct vk_graphics_pipeline_state gfx;
+   struct vk_render_pass_state rp;
+   struct vk_color_blend_state cb;
+   struct vk_color_attachment_location_state cal;
+   struct vk_input_attachment_location_state ial;
+   struct vk_multisample_state ms;
+   struct vk_multiview_state mv;
+};
+
+static VkFormat
+color_output_format(const struct glsl_type *type)
+{
+   switch (glsl_get_base_type(glsl_without_array(type))) {
+   case GLSL_TYPE_INT:
+   case GLSL_TYPE_INT16:
+   case GLSL_TYPE_INT8:
+      return VK_FORMAT_R32G32B32A32_SINT;
+   case GLSL_TYPE_UINT:
+   case GLSL_TYPE_UINT16:
+   case GLSL_TYPE_UINT8:
+      return VK_FORMAT_R32G32B32A32_UINT;
+   default:
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
+   }
+}
+
+static void
+pipeline_state_init(struct pipeline_state *ps, const nir_shader *nir)
+{
+   memset(ps, 0, sizeof(*ps));
+   uint8_t count = 0;
+   nir_foreach_shader_out_variable(var, nir) {
+      if (var->data.location < FRAG_RESULT_DATA0)
+         continue;
+      unsigned first = var->data.location - FRAG_RESULT_DATA0;
+      unsigned slots = MAX2(glsl_count_attribute_slots(var->type, false), 1);
+      for (unsigned s = first; s < MIN2(first + slots, MESA_VK_MAX_COLOR_ATTACHMENTS);
+           s++) {
+         ps->rp.color_attachment_formats[s] = color_output_format(var->type);
+         ps->rp.color_attachment_samples[s] = 1;
+         ps->rp.attachments |= MESA_VK_RP_ATTACHMENT_COLOR_0_BIT << s;
+         count = MAX2(count, s + 1);
+      }
+   }
+   ps->rp.color_attachment_count = count;
+   ps->rp.depth_attachment_format = VK_FORMAT_D32_SFLOAT;
+   ps->rp.depth_stencil_attachment_samples = 1;
+   ps->rp.attachments |= MESA_VK_RP_ATTACHMENT_DEPTH_BIT;
+
+   ps->cb.attachment_count = count;
+   ps->cb.color_write_enables = BITFIELD_MASK(MESA_VK_MAX_COLOR_ATTACHMENTS);
+   for (unsigned i = 0; i < MESA_VK_MAX_COLOR_ATTACHMENTS; i++) {
+      ps->cb.attachments[i] = (struct vk_color_blend_attachment_state){
+         .blend_enable = false,
+         .src_color_blend_factor = VK_BLEND_FACTOR_ONE,
+         .dst_color_blend_factor = VK_BLEND_FACTOR_ZERO,
+         .src_alpha_blend_factor = VK_BLEND_FACTOR_ONE,
+         .dst_alpha_blend_factor = VK_BLEND_FACTOR_ZERO,
+         .write_mask = 0xf,
+         .color_blend_op = VK_BLEND_OP_ADD,
+         .alpha_blend_op = VK_BLEND_OP_ADD,
+      };
+      ps->cal.color_map[i] = i;
+      ps->ial.color_map[i] = i;
+   }
+   ps->ial.color_attachment_count = count;
+   ps->ial.depth_att = MESA_VK_ATTACHMENT_NO_INDEX;
+   ps->ial.stencil_att = MESA_VK_ATTACHMENT_NO_INDEX;
+
+   ps->ms.rasterization_samples = VK_SAMPLE_COUNT_1_BIT;
+   ps->ms.sample_mask = 0xffff;
+
+   ps->gfx.shader_stages = VK_SHADER_STAGE_VERTEX_BIT |
+                           VK_SHADER_STAGE_FRAGMENT_BIT;
+   ps->gfx.rp = &ps->rp;
+   ps->gfx.cb = &ps->cb;
+   ps->gfx.cal = &ps->cal;
+   ps->gfx.ial = &ps->ial;
+   ps->gfx.ms = &ps->ms;
+   ps->gfx.mv = &ps->mv;
+}
+
 static bool
 compile(const uint32_t *words, size_t bytes, struct options *opts)
 {
@@ -624,11 +734,13 @@ compile(const uint32_t *words, size_t bytes, struct options *opts)
    case arch:                                                                  \
       ops = (struct arch_ops){&panvk_v##arch##_offline_shader_ops,             \
                               panvk_v##arch##_compile_shader_offline,          \
-                              panvk_v##arch##_CreateDescriptorSetLayout};      \
+                              panvk_v##arch##_CreateDescriptorSetLayout,       \
+                              panvk_v##arch##_offline_shader_variants};        \
       break
       ARCH_CASE(9);
       ARCH_CASE(10);
       ARCH_CASE(11);
+      ARCH_CASE(15);
 #undef ARCH_CASE
    default:
       return false;
@@ -723,16 +835,27 @@ compile(const uint32_t *words, size_t bytes, struct options *opts)
       .set_layout_count = set_count,
       .set_layouts = layouts,
    };
-   VkResult result = ops.compile(&device, &info, opts->preamble, &shader);
+   static const uint32_t no_noperspective = 0;
+   struct pipeline_state pipeline;
+   const struct vk_graphics_pipeline_state *state = NULL;
+   const uint32_t *noperspective = NULL;
+   if (opts->pipeline && opts->stage == MESA_SHADER_FRAGMENT) {
+      pipeline_state_init(&pipeline, nir);
+      state = &pipeline.gfx;
+   } else if (opts->pipeline && opts->stage == MESA_SHADER_VERTEX) {
+      noperspective = &no_noperspective;
+   }
+   VkResult result = ops.compile(&device, &info, state, noperspective,
+                                 opts->preamble, &shader);
    if (result != VK_SUCCESS) {
       fprintf(stderr, "Kraid compilation failed: %d\n", result);
       goto cleanup;
    }
    char input_hash[BLAKE3_HEX_LEN];
    hash_hex(words, bytes, input_hash);
-   struct panvk_shader *pan_shader =
-      container_of(shader, struct panvk_shader, vk);
-   ok = write_artifacts(opts, pan_shader, input_hash);
+   struct kraidoc_variant variants[8];
+   unsigned variant_count = ops.variants(shader, variants, ARRAY_SIZE(variants));
+   ok = write_artifacts(opts, variants, variant_count, input_hash);
    if (ok && !opts->legacy) {
       FILE *report = opts->output ? fopen(opts->output, "w") : stdout;
       if (!report) {
@@ -752,7 +875,7 @@ compile(const uint32_t *words, size_t bytes, struct options *opts)
             .write_context = write_report_context,
          };
          ok = kraidoc_write_report(report, opts->json, opts->detailed, &ctx,
-                                   pan_shader);
+                                   variants, variant_count);
          if (report != stdout)
             ok &= close_output(report);
       }
@@ -760,6 +883,8 @@ compile(const uint32_t *words, size_t bytes, struct options *opts)
 cleanup:
    if (shader)
       shader->ops->destroy(&device.vk, shader, NULL);
+   if (util_queue_is_initialized(&device.bg_compile.queue))
+      util_queue_destroy(&device.bg_compile.queue);
    ralloc_free(nir);
    for (unsigned set = 0; set < set_count; set++)
       if (layouts[set])
@@ -774,8 +899,9 @@ usage(FILE *f)
    fputs(
       "Usage: kraidoc [options] shader.spv\n"
       "  -c, --core NAME          Mali-G610 (default), G710, G310v1..v5,\n"
-      "                          G57, G68, G615, G715\n"
-      "  --gpu-id N --gpu-variant N  Exact known Valhall target\n"
+      "                          G57, G68, G615, G715, G2-Ultra, G2-Premium,\n"
+      "                          G2-Pro\n"
+      "  --gpu-id N --gpu-variant N  Exact known target\n"
       "  --shader-cores N         CPU compile context, default 4\n"
       "  -n, --name NAME          Entry point, default main (--entry alias)\n"
       "  -v/--vertex -f/--fragment -C/--compute\n"
@@ -788,6 +914,9 @@ usage(FILE *f)
       "  --report-format malioc|kraid  Report schema; kraid keeps -o PREFIX\n"
       "  --spec ID:BYTES:BITS      Specialization raw bits; repeatable\n"
       "  --binding SET:BINDING:TYPE:COUNT  Descriptor layout override\n"
+      "  --pipeline               Static default pipeline state (fixed-function\n"
+      "                          blend, identity attachment maps, perspective\n"
+      "                          varyings)\n"
       "  --no-preamble --nir -l/--list -i/--info --version --help\n"
       "  --vulkan --spirv         Vulkan SPIR-V input (- for stdin)\n",
       f);
@@ -870,6 +999,10 @@ main(int argc, char **argv)
       }
       if (!strcmp(arg, "--nir")) {
          opts.nir = true;
+         continue;
+      }
+      if (!strcmp(arg, "--pipeline")) {
+         opts.pipeline = true;
          continue;
       }
       const char *value = NULL;
@@ -962,21 +1095,28 @@ main(int argc, char **argv)
          if (strcmp(opts.cpu, m->name) && strcmp(opts.cpu, m->name + 5))
             continue;
          unsigned arch = m->gpu_prod_id >> 16;
-         if (arch < 9 || arch > 11)
+         if (!kraidoc_arch_supported(arch))
             continue;
-         opts.gpu_id = (uint64_t)(arch << 12 | (m->gpu_prod_id & 0xfff)) << 16;
+         if (arch >= PAN_ID64_COMPAT) {
+            opts.gpu_id = (uint64_t)arch << 56 |
+                          (uint64_t)((m->gpu_prod_id >> 8) & 0xff) << 48 |
+                          (uint64_t)(m->gpu_prod_id & 0xff) << 32 |
+                          PAN_ID64_COMPAT << 28;
+         } else {
+            opts.gpu_id = (uint64_t)(arch << 12 | (m->gpu_prod_id & 0xfff)) << 16;
+         }
          opts.gpu_variant = m->gpu_variant;
          found = true;
          break;
       }
       if (!found) {
-         fprintf(stderr, "Unknown Valhall target: %s\n", opts.cpu);
+         fprintf(stderr, "Unknown target: %s\n", opts.cpu);
          return 2;
       }
    }
-   if (pan_arch(opts.gpu_id) < 9 || pan_arch(opts.gpu_id) > 11 ||
+   if (!kraidoc_arch_supported(pan_arch(opts.gpu_id)) ||
        !pan_get_model(opts.gpu_id, opts.gpu_variant)) {
-      fputs("Only known Valhall GPU IDs and variants are supported\n", stderr);
+      fputs("Only known Valhall and v15 GPU IDs and variants are supported\n", stderr);
       return 2;
    }
    if (opts.info) {

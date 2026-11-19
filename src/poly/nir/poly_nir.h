@@ -46,11 +46,18 @@ struct poly_gs_info {
 
    /* Static topology used if shape = POLY_GS_SHAPE_STATIC_INDEXED */
    uint8_t topology[64];
+
+   int static_vertices;
 };
 
 bool poly_nir_lower_gs(struct nir_shader *gs, struct nir_shader **gs_count,
                        struct nir_shader **gs_copy, struct nir_shader **pre_gs,
                        struct poly_gs_info *info);
+
+bool poly_nir_lower_gs_vertex_output(struct nir_shader *gs,
+                                     struct nir_shader **gs_count,
+                                     struct nir_shader **pre_gs,
+                                     struct poly_gs_info *info);
 
 bool poly_nir_lower_tcs(struct nir_shader *tcs,
                         bool can_ignore_shader_out_barriers);

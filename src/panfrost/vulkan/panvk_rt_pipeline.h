@@ -12,9 +12,18 @@ struct panvk_device;
 struct panvk_shader;
 struct panvk_nir_rt_pipeline_stage;
 
+struct panvk_rt_capture_replay_handle {
+   struct panvk_rt_shader_group_handle handle;
+   blake3_hash hash;
+};
+
+_Static_assert(sizeof(struct panvk_rt_capture_replay_handle) == 64,
+               "ray tracing capture replay handle size");
+
 struct panvk_rt_pipeline_group {
    VkRayTracingShaderGroupCreateInfoKHR info;
    struct panvk_rt_shader_group_handle handle;
+   struct panvk_rt_capture_replay_handle capture_replay;
    struct panvk_rt_shader_group_stack_sizes stack_sizes;
 };
 
@@ -27,6 +36,10 @@ struct panvk_rt_pipeline {
    struct vk_pipeline_robustness_state robustness;
    blake3_hash key;
    uint32_t *stage_stack_sizes;
+   uint32_t *stage_entry_offsets;
+   uint32_t native_frame_stride;
+   uint32_t native_tls_offset;
+   uint32_t external_frame_size;
    uint32_t stage_count;
    uint32_t registered_stage_count;
    uint32_t group_count;
@@ -37,6 +50,8 @@ struct panvk_rt_pipeline {
    VkDeviceSize stack_size;
    VkDeviceSize compiled_stack_size;
    bool stack_size_dynamic;
+   bool native_direct_sbt;
+   bool native_tls;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(panvk_rt_pipeline, vk.base, VkPipeline,
@@ -63,8 +78,12 @@ VkResult panvk_per_arch(rt_pipeline_import)(
 VkResult panvk_per_arch(rt_compile_nir)(
    struct panvk_device *dev, nir_shader *nir, struct vk_pipeline_layout *layout,
    const struct vk_pipeline_robustness_state *robustness,
-   VkPipelineCreateFlags2KHR flags, const VkAllocationCallbacks *alloc,
-   struct panvk_shader **shader_out);
+   VkPipelineCreateFlags2KHR flags, uint32_t ray_query_slots,
+   const VkAllocationCallbacks *alloc, struct panvk_shader **shader_out);
+
+VkResult panvk_per_arch(rt_link_native_shaders)(
+   struct panvk_device *dev, struct panvk_rt_pipeline *pipeline,
+   struct panvk_shader **functions, const VkAllocationCallbacks *alloc);
 
 void panvk_per_arch(cmd_bind_rt_pipeline)(struct vk_command_buffer *cmd,
                                          struct panvk_rt_pipeline *pipeline);

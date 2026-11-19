@@ -38,6 +38,9 @@ enum ExpressionKind {
     FAdd(FRound, FClamp),
     Fma(FRound, FClamp),
     FmaRScale(FRound, FClamp),
+    FMath(crate::ops::FMathKind),
+    FNative(crate::ops::FMathKind),
+    FSinCos(bool),
     FSinTable(bool),
     FCosTable(bool),
     Clper(u8, u8, u8),
@@ -60,6 +63,9 @@ impl Expression {
             Op::Fma(op) if op.dst_type == DataType::F32 =>
                 ExpressionKind::Fma(op.round, op.clamp),
             Op::FmaRScale(op) => ExpressionKind::FmaRScale(op.round, op.clamp),
+            Op::FMath(op) => ExpressionKind::FMath(op.kind),
+            Op::FNative(op) => ExpressionKind::FNative(op.kind),
+            Op::FSinCos(op) => ExpressionKind::FSinCos(op.is_cos),
             Op::FSinTable(op) => ExpressionKind::FSinTable(op.offset),
             Op::FCosTable(op) => ExpressionKind::FCosTable(op.offset),
             Op::Clper(op) => ExpressionKind::Clper(
@@ -196,8 +202,16 @@ mod tests {
         let sin = alloc.alloc_ssa(32);
         let cos = alloc.alloc_ssa(32);
         let mut b = SSAInstrBuilder::new(model.as_ref(), &mut alloc);
-        b.fsincos_32_to(sin.into(), input.into(), false);
-        b.fsincos_32_to(cos.into(), input.into(), true);
+        use crate::lower_math::MathBuilder;
+        use crate::ops::{OpFMath, FMathKind};
+        b.lower_math_op(OpFMath {
+            dst: sin.into(), kind: FMathKind::Sin,
+            srcs: [input.into(), 0_u32.into()],
+        });
+        b.lower_math_op(OpFMath {
+            dst: cos.into(), kind: FMathKind::Cos,
+            srcs: [input.into(), 0_u32.into()],
+        });
         b.fadd_32(sin.into(), cos.into());
         let mut instrs = b.into_vec();
         assert!(cse_block(&mut instrs));

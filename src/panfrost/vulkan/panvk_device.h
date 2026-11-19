@@ -29,7 +29,9 @@
 #include "util/simple_mtx.h"
 #include "util/u_dynarray.h"
 #include "util/u_call_once.h"
+#include "util/u_atomic.h"
 #include "util/u_printf.h"
+#include "util/u_queue.h"
 #include "util/vma.h"
 
 /* On JM hardware, we need to allocate a buffer depending on vertex count.
@@ -140,6 +142,13 @@ struct panvk_device {
       struct util_dynarray retired;
    } ray_query;
 
+   struct {
+      util_once_flag once;
+      struct util_queue queue;
+      bool ready;
+      uint32_t pending;
+   } bg_compile;
+
    union {
       struct {
          struct {
@@ -152,6 +161,33 @@ struct panvk_device {
    };
 
    uint32_t shader_core_count;
+
+   struct {
+      uint64_t submits;
+      uint64_t cmdbufs;
+      uint64_t ring_entries[3];
+      uint64_t barriers;
+      uint64_t self_waits[3];
+      uint64_t flush_others_only[3];
+      uint64_t flush_other[3];
+      uint64_t flush_deferred[3];
+      uint64_t others_covered;
+      uint64_t others_restored;
+      uint64_t sync_signals[3];
+      uint64_t sync_waits[3];
+      uint64_t cb_tails_drained;
+      uint64_t cb_tails_merged;
+      uint64_t handoffs_shared_sb;
+      uint64_t handoffs_mem;
+      uint64_t dispatch_direct;
+      uint64_t dispatch_indirect;
+      uint64_t dispatch_inferred;
+      uint64_t pilot_batches;
+      int64_t last_print_ns;
+   } csstats;
+
+   bool dvs_enabled;
+   struct panvk_dynamic_cache *dynamic_cache;
 
    int drm_fd;
 };
@@ -186,6 +222,14 @@ panvk_get_csif_props(const struct panvk_device *dev)
 #endif
 }
 
+#define panvk_csstat_add(dev, field, val)                                      \
+   do {                                                                        \
+      if (PANVK_DEBUG(CSSTATS))                                                \
+         p_atomic_add(&(dev)->csstats.field, (val));                           \
+   } while (0)
+
+#define panvk_csstat_inc(dev, field) panvk_csstat_add(dev, field, 1)
+
 /* Latest cache-flush ID, sourced from the panthor uAPI or the kbase CSF
  * USER register page depending on which backend the device came from. */
 static inline uint32_t
@@ -204,6 +248,13 @@ panvk_get_flush_id(const struct panvk_device *dev)
 #else
    return panthor_kmod_get_flush_id(dev->kmod.dev);
 #endif
+}
+
+static inline void
+panvk_device_finish_bg_compile(struct panvk_device *dev)
+{
+   if (util_queue_is_initialized(&dev->bg_compile.queue))
+      util_queue_destroy(&dev->bg_compile.queue);
 }
 
 static inline void

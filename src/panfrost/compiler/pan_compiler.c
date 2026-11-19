@@ -68,14 +68,13 @@ pan_use_kraid(unsigned arch, mesa_shader_stage stage, bool internal)
 
    switch (stage) {
    case MESA_SHADER_VERTEX:
+   case MESA_SHADER_TESS_EVAL:
+   case MESA_SHADER_GEOMETRY:
       return use_kraid & USE_KRAID_VS;
    case MESA_SHADER_FRAGMENT:
       return use_kraid & USE_KRAID_FS;
-   case MESA_SHADER_COMPUTE:
-   case MESA_SHADER_KERNEL:
-      return use_kraid & USE_KRAID_CS;
    default:
-      return false;
+      return use_kraid & USE_KRAID_CS;
    }
 #else
    return false;

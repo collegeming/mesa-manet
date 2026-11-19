@@ -30,6 +30,104 @@ fn fixed_wait_slot(i: &Instr) -> Option<usize> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MemFootprint {
+    base: Option<RegRef>,
+    start: i32,
+    end: i32,
+}
+
+impl MemFootprint {
+    fn of(op: &Op) -> MemFootprint {
+        let (addr, offset, bytes) = match op {
+            Op::Load(op) => (&op.addr, op.offset, op.dst_type.total_bits().div_ceil(8)),
+            Op::Store(op) => (&op.addr, op.offset, op.src_type.total_bits().div_ceil(8)),
+            Op::LdMulti(op) => (&op.addr, op.offset, op.dst.dst_ref.as_reg().unwrap().bytes()),
+            Op::StMulti(op) => (&op.addr, op.offset, op.data.src_ref.as_reg().unwrap().bytes()),
+            _ => {
+                return MemFootprint {
+                    base: None,
+                    start: 0,
+                    end: 0,
+                };
+            }
+        };
+        let base = match &addr.src_ref {
+            SrcRef::Reg(reg)
+                if addr.src_mod.is_none() && addr.swizzle == Swizzle::NONE =>
+            {
+                Some(*reg)
+            }
+            _ => None,
+        };
+        let start = i32::from(offset);
+        MemFootprint {
+            base,
+            start,
+            end: start + i32::from(bytes),
+        }
+    }
+
+    fn may_alias(&self, other: &MemFootprint) -> bool {
+        match (self.base, other.base) {
+            (Some(a), Some(b)) if a == b => {
+                self.start < other.end && other.start < self.end
+            }
+            _ => true,
+        }
+    }
+
+    fn invalidate_written(&mut self, written: &RegRef) {
+        if let Some(base) = self.base {
+            let a = base.reg_range();
+            let b = written.reg_range();
+            if a.start < b.end && b.start < a.end {
+                self.base = None;
+            }
+        }
+    }
+}
+
+fn next_aliasing(
+    accesses: &[(usize, MemFootprint)],
+    footprint: &MemFootprint,
+) -> Option<usize> {
+    accesses
+        .iter()
+        .rev()
+        .find(|(_, other)| footprint.may_alias(other))
+        .map(|(ip, _)| *ip)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::model_for_gpu_id;
+    use crate::ops::{OpLdMulti, OpStMulti};
+
+    #[test]
+    fn multi_ranges_preserve_aliases_without_serializing_disjoint_stores() {
+        let addr: Src = RegRef::new(8, RegRange::Regs(2)).into();
+        let store = |reg, offset| Instr::from(OpStMulti {
+            data: RegRef::new(reg, RegRange::Regs(16)).into(), addr: addr.clone(), offset,
+        });
+        let load = |reg, offset| Instr::from(OpLdMulti {
+            dst: RegRef::new(reg, RegRange::Regs(16)).into(), addr: addr.clone(), offset,
+        });
+        let first = MemFootprint::of(&store(20, 0).op);
+        assert!(!first.may_alias(&MemFootprint::of(&store(36, 64).op)));
+        assert!(first.may_alias(&MemFootprint::of(&store(36, 60).op)));
+        let model = model_for_gpu_id(0x0f080000f0000000, 4).unwrap();
+        let block = BasicBlock {
+            label: LabelAllocator::default().alloc(),
+            instrs: vec![store(20, 0), store(36, 64), load(20, 0), load(36, 64)],
+        };
+        let deadlines = calc_message_deadlines_in_bb(model.as_ref(), &block);
+        assert_eq!(deadlines[0], Some(2));
+        assert_eq!(deadlines[1], Some(3));
+    }
+}
+
 fn calc_message_deadlines_in_bb(
     model: &dyn Model,
     block: &BasicBlock,
@@ -37,14 +135,20 @@ fn calc_message_deadlines_in_bb(
     let reg_count = model.max_reg_count();
     let mut deadlines = vec![None; block.instrs.len()];
     let mut next_access = vec![None; reg_count as usize];
-    let mut next_load = None;
-    let mut next_store = None;
+    let mut loads: Vec<(usize, MemFootprint)> = Vec::new();
+    let mut stores: Vec<(usize, MemFootprint)> = Vec::new();
     let mut next_barrier = None;
     let mut next_ld_var = None;
 
     for (ip, instr) in block.instrs.iter().enumerate().rev() {
         let effect = instr.op.memory_effect();
         let var_usage = instr.op.var_update_mode();
+
+        for reg in instr.op.iter_reg_defs() {
+            for (_, access) in loads.iter_mut().chain(stores.iter_mut()) {
+                access.invalidate_written(reg);
+            }
+        }
 
         if model.op_is_message(&instr.op) {
             let next_reg_access = instr
@@ -54,12 +158,17 @@ fn calc_message_deadlines_in_bb(
                 .filter_map(|reg| next_access[usize::from(reg)])
                 .min();
 
+            let footprint = MemFootprint::of(&instr.op);
             let next_mem_hazard = match effect {
                 MemoryEffect::None | MemoryEffect::ConstRead => None,
-                MemoryEffect::Read => next_store,
-                MemoryEffect::Write | MemoryEffect::ReadWrite => {
-                    [next_load, next_store].into_iter().flatten().min()
-                }
+                MemoryEffect::Read => next_aliasing(&stores, &footprint),
+                MemoryEffect::Write | MemoryEffect::ReadWrite => [
+                    next_aliasing(&loads, &footprint),
+                    next_aliasing(&stores, &footprint),
+                ]
+                .into_iter()
+                .flatten()
+                .min(),
             };
 
             // All LD_VAR has a hidden register, we only care about WaR/WaW.
@@ -87,17 +196,19 @@ fn calc_message_deadlines_in_bb(
         // a later load cannot overtake an earlier store from another warp.
         // Virtual barriers have no HW instruction to carry the wait, so they
         // wait on the preceding instruction as well.
-        if matches!(instr.op, Op::Barrier(_) | Op::ScheduleBarrier(_)) {
+        if matches!(instr.op, Op::Barrier(_) | Op::ScheduleBarrier(_)
+                    | Op::RtCall(_) | Op::RtReturn(_)) {
             next_barrier = Some(ip);
         }
 
+        let footprint = MemFootprint::of(&instr.op);
         match effect {
             MemoryEffect::None | MemoryEffect::ConstRead => (),
-            MemoryEffect::Read => next_load = Some(ip),
-            MemoryEffect::Write => next_store = Some(ip),
+            MemoryEffect::Read => loads.push((ip, footprint)),
+            MemoryEffect::Write => stores.push((ip, footprint)),
             MemoryEffect::ReadWrite => {
-                next_load = Some(ip);
-                next_store = Some(ip);
+                loads.push((ip, footprint));
+                stores.push((ip, footprint));
             }
         }
 
@@ -144,7 +255,9 @@ impl Shader<'_> {
 
             for ip in 0..block.instrs.len() {
                 // No need to insert wait at the end of the shader.
-                if block.instrs[ip].flow.get_end_shader() {
+                if block.instrs[ip].flow.get_end_shader()
+                    && !matches!(block.instrs[ip].op, Op::RtReturn(_))
+                {
                     break;
                 }
 

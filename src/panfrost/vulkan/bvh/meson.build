@@ -2,13 +2,17 @@
 # SPDX-License-Identifier: MIT
 
 panvk_bvh_shaders = [
+  ['leaf.comp', 'leaf'],
   ['encode.comp', 'encode'],
   ['copy.comp', 'copy'],
+  ['update.comp', 'update'],
+  ['micromap.comp', 'micromap'],
+  ['micromap_copy.comp', 'micromap_copy'],
 ]
 
 panvk_bvh_include_dir = dir_source_root + '/src/panfrost/vulkan/bvh'
 
-panvk_bvh_includes = files('panvk_bvh.h')
+panvk_bvh_includes = files('panvk_bvh.h', 'panvk_bvh_box.h', 'panvk_bvh_leaf.h', 'panvk_bvh_omm.h', 'panvk_micromap.h')
 
 panvk_bvh_spv = []
 foreach s : panvk_bvh_shaders

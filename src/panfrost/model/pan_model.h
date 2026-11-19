@@ -58,6 +58,8 @@ struct pan_model {
    /* GPU variant. */
    uint32_t gpu_variant;
 
+   uint16_t max_fau_words;
+
    /* Marketing name for the GPU, used as the GL_RENDERER */
    const char *name;
 
@@ -101,6 +103,13 @@ struct pan_model {
 };
 
 const struct pan_model *pan_get_model(uint64_t gpu_id, uint32_t gpu_variant);
+
+static inline unsigned
+pan_max_push(uint64_t gpu_id, uint32_t gpu_variant)
+{
+   const struct pan_model *model = pan_get_model(gpu_id, gpu_variant);
+   return model && model->max_fau_words ? model->max_fau_words : 128;
+}
 
 extern const struct pan_model pan_model_list[];
 extern const unsigned pan_model_count;

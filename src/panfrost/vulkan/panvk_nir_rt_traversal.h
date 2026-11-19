@@ -45,6 +45,13 @@ struct panvk_nir_rt_event {
 
 struct panvk_nir_rt_report_context;
 
+nir_def *panvk_nir_rt_leaf_word(nir_builder *b, nir_def *as, nir_def *kind,
+                               nir_def *primitive, unsigned word);
+
+nir_def *panvk_nir_rt_triangle_vertex(nir_builder *b, nir_def *as,
+                                     nir_def *kind, nir_def *primitive,
+                                     unsigned vertex);
+
 struct panvk_nir_rt_callbacks {
    nir_def *(*any_hit)(nir_builder *b,
                       const struct panvk_nir_rt_event *event, void *data);

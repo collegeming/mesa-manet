@@ -409,8 +409,8 @@ panvk_copy_image_to_image(struct panvk_image *dst,
    assert(dst_plane_idx < PANVK_MAX_PLANES);
    struct panvk_image_plane *src_plane = &src->planes[src_plane_idx];
    struct panvk_image_plane *dst_plane = &dst->planes[dst_plane_idx];
-   const struct pan_image_layout *src_plane_layout = &dst_plane->plane.layout;
-   const struct pan_image_layout *dst_plane_layout = &src_plane->plane.layout;
+   const struct pan_image_layout *src_plane_layout = &src_plane->plane.layout;
+   const struct pan_image_layout *dst_plane_layout = &dst_plane->plane.layout;
    const struct pan_image_slice_layout *src_slice_layout =
       &src_plane_layout->slices[src_subres.mipLevel];
    const struct pan_image_slice_layout *dst_slice_layout =
@@ -464,9 +464,9 @@ panvk_copy_image_to_image(struct panvk_image *dst,
       unsigned src_layer = layer + src_subres.baseArrayLayer;
       unsigned dst_layer = layer + dst_subres.baseArrayLayer;
       void *src_layer_ptr = src_base_ptr +
-         src_layer * src_slice_layout->tiled_or_linear.surface_stride_B;
+         src_layer * src_plane_layout->array_stride_B;
       void *dst_layer_ptr = dst_base_ptr +
-         dst_layer * dst_slice_layout->tiled_or_linear.surface_stride_B;
+         dst_layer * dst_plane_layout->array_stride_B;
 
       if (flags & VK_HOST_IMAGE_COPY_MEMCPY_BIT) {
          assert(src_slice_layout->size_B == dst_slice_layout->size_B);

@@ -15,7 +15,7 @@
 #include <string.h>
 
 #define PANVK_RT_BINARY_MAGIC UINT64_C(0x314254524b564e50)
-#define PANVK_RT_BINARY_VERSION 1
+#define PANVK_RT_BINARY_VERSION 16
 
 struct rt_binary_data {
    void *data;
@@ -214,13 +214,19 @@ rt_pipeline_serialize(struct panvk_device *dev,
    blob_write_uint32(blob, pipeline->max_payload_size);
    blob_write_uint32(blob, pipeline->max_hit_attribute_size);
    blob_write_uint32(blob, pipeline->frame_size);
+   blob_write_uint32(blob, pipeline->native_frame_stride);
    blob_write_uint64(blob, pipeline->compiled_stack_size);
    blob_write_uint32(blob, pipeline->stack_size_dynamic);
+   blob_write_uint32(blob, pipeline->native_direct_sbt);
+   blob_write_uint32(blob, pipeline->native_tls_offset);
+   blob_write_uint32(blob, pipeline->external_frame_size);
+   blob_write_uint32(blob, pipeline->native_tls);
    blob_write_bytes(blob, &pipeline->robustness, sizeof(pipeline->robustness));
    for (uint32_t i = 0; i < pipeline->stage_count; i++) {
       blob_write_uint32(blob, pipeline->stages[i].stage);
       blob_write_uint32(blob, pipeline->stages[i].id);
       blob_write_uint32(blob, pipeline->stage_stack_sizes[i]);
+      blob_write_uint32(blob, pipeline->stage_entry_offsets ? pipeline->stage_entry_offsets[i] : 0);
       struct blob nir;
       blob_init(&nir);
       nir_serialize(&nir, pipeline->stages[i].nir, false);
@@ -304,8 +310,13 @@ panvk_per_arch(rt_pipeline_import)(
    uint32_t max_payload = blob_read_uint32(&reader);
    uint32_t max_attribute = blob_read_uint32(&reader);
    uint32_t frame_size = blob_read_uint32(&reader);
+   uint32_t native_stride = blob_read_uint32(&reader);
    uint64_t stack_size = blob_read_uint64(&reader);
    uint32_t dynamic = blob_read_uint32(&reader);
+   uint32_t direct_sbt = blob_read_uint32(&reader);
+   uint32_t native_tls_offset = blob_read_uint32(&reader);
+   uint32_t external_frame_size = blob_read_uint32(&reader);
+   uint32_t native_tls = blob_read_uint32(&reader);
    struct vk_pipeline_robustness_state robustness;
    blob_copy_bytes(&reader, &robustness, sizeof(robustness));
    uint64_t expected_stages = info->stageCount;
@@ -326,7 +337,17 @@ panvk_per_arch(rt_pipeline_import)(
        max_payload != pipeline->max_payload_size ||
        max_attribute != pipeline->max_hit_attribute_size ||
        dynamic != pipeline->stack_size_dynamic ||
-       frame_size % 128 || (stage_count && frame_size < 384) ||
+       direct_sbt > 1 ||
+       native_tls > 1 || (!native_stride && native_tls) ||
+       external_frame_size % 128 ||
+       (native_stride && external_frame_size < 128) ||
+       (!native_stride && external_frame_size) ||
+       native_tls_offset % 128 ||
+       native_tls_offset > UINT32_MAX - stack_size ||
+       (direct_sbt && (!native_stride ||
+                      (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR))) ||
+       frame_size % 128 || (stage_count && frame_size < (native_stride ? 256 : 384)) ||
+       (native_stride && native_stride % 16) ||
        stack_size > UINT32_MAX ||
        stage_count > (reader.end - reader.current) / 24 ||
        stage_bytes > SIZE_MAX || group_bytes > SIZE_MAX)
@@ -334,6 +355,11 @@ panvk_per_arch(rt_pipeline_import)(
    pipeline->robustness = robustness;
    pipeline->vk.stages = stages;
    pipeline->frame_size = frame_size;
+   pipeline->native_frame_stride = native_stride;
+   pipeline->native_direct_sbt = direct_sbt;
+   pipeline->native_tls_offset = native_tls_offset;
+   pipeline->external_frame_size = external_frame_size;
+   pipeline->native_tls = native_tls;
    pipeline->compiled_stack_size = stack_size;
    pipeline->stages = vk_zalloc2(&dev->vk.alloc, alloc,
       stage_bytes, 8,
@@ -341,11 +367,14 @@ panvk_per_arch(rt_pipeline_import)(
    pipeline->stage_stack_sizes = vk_zalloc2(&dev->vk.alloc, alloc,
       (size_t)stage_count * sizeof(*pipeline->stage_stack_sizes), 8,
       VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+   pipeline->stage_entry_offsets = vk_zalloc2(&dev->vk.alloc, alloc,
+      (size_t)stage_count * sizeof(*pipeline->stage_entry_offsets), 8,
+      VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    pipeline->groups = vk_zalloc2(&dev->vk.alloc, alloc,
       group_bytes, 8,
       VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    original_ids = malloc((size_t)stage_count * sizeof(*original_ids));
-   if ((stage_count && (!pipeline->stages || !pipeline->stage_stack_sizes)) ||
+   if ((stage_count && (!pipeline->stages || !pipeline->stage_stack_sizes || !pipeline->stage_entry_offsets)) ||
        (stage_count && !original_ids) || (group_count && !pipeline->groups)) {
       result = VK_ERROR_OUT_OF_HOST_MEMORY;
       goto done;
@@ -357,6 +386,7 @@ panvk_per_arch(rt_pipeline_import)(
       uint32_t stage = blob_read_uint32(&reader);
       uint32_t id = blob_read_uint32(&reader);
       uint32_t stage_stack = blob_read_uint32(&reader);
+      uint32_t entry_offset = blob_read_uint32(&reader);
       struct blob_reader nir;
       if (stage < MESA_SHADER_RAYGEN || stage > MESA_SHADER_CALLABLE ||
           !id || id > INT32_MAX || !rt_read_chunk(&reader, &nir) ||
@@ -366,13 +396,20 @@ panvk_per_arch(rt_pipeline_import)(
       pipeline->stages[pipeline->stage_count++] =
          (struct panvk_nir_rt_pipeline_stage){.nir = shader, .stage = stage, .id = id};
       pipeline->stage_stack_sizes[i] = stage_stack;
+      pipeline->stage_entry_offsets[i] = entry_offset;
       original_ids[i] = id;
       if (nir.overrun || nir.current != nir.end || shader->info.stage != stage)
          goto done;
       if (i < info->stageCount) {
          if (info->pStages && vk_to_mesa_shader_stage(info->pStages[i].stage) != stage)
             goto done;
-         result = panvk_per_arch(rt_stage_import)(shader, &pipeline->stages[i].id);
+         if (pipeline->vk.flags & VK_PIPELINE_CREATE_2_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR) {
+            result = panvk_per_arch(rt_stage_register)(shader, pipeline->stages[i].id);
+            if (result == VK_ERROR_UNKNOWN)
+               result = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+         } else {
+            result = panvk_per_arch(rt_stage_import)(shader, &pipeline->stages[i].id);
+         }
       } else {
          uint32_t index = i - info->stageCount;
          for (uint32_t l = 0; l < info->pLibraryInfo->libraryCount; l++) {
@@ -459,6 +496,13 @@ panvk_per_arch(rt_pipeline_import)(
       };
       if (memcmp(&handle, &expected_handle, sizeof(handle)))
          goto done;
+      if (expected_info.pShaderGroupCaptureReplayHandle &&
+          memcmp(expected_info.pShaderGroupCaptureReplayHandle,
+                 &pipeline->groups[i].capture_replay,
+                 sizeof(pipeline->groups[i].capture_replay))) {
+         result = VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+         goto done;
+      }
       pipeline->group_count++;
    }
    uint32_t has_shader = blob_read_uint32(&reader);
@@ -485,6 +529,20 @@ panvk_per_arch(rt_pipeline_import)(
       result = VK_ERROR_UNKNOWN;
       if (code.overrun || code.current != code.end)
          goto done;
+      if (native_stride) {
+         const struct panvk_shader_variant *v = &pipeline->shader->variants[0];
+         if (!v->info.contains_jump_ex)
+            goto done;
+         uint64_t address = panvk_shader_variant_get_dev_addr(v);
+         if (address >> 32 != (address + v->bin_size - 1) >> 32)
+            goto done;
+         for (unsigned i = 0; i < stage_count; i++) {
+            if (!pipeline->stage_entry_offsets[i] ||
+                pipeline->stage_entry_offsets[i] >= v->bin_size ||
+                pipeline->stage_entry_offsets[i] % 128)
+               goto done;
+         }
+      }
    }
    if (!reader.overrun && reader.current == reader.end)
       result = VK_SUCCESS;

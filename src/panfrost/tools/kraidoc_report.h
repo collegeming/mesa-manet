@@ -7,7 +7,20 @@
 
 #include "compiler/shader_enums.h"
 
-struct panvk_shader;
+struct pan_shader_info;
+
+struct kraidoc_program {
+   const struct pan_shader_info *info;
+   const void *bin;
+   uint32_t size;
+};
+
+struct kraidoc_variant {
+   unsigned index;
+   struct kraidoc_program main;
+   struct kraidoc_program pilot;
+   const char *nir_str;
+};
 
 struct kraidoc_report_context {
    const char *filename, *entrypoint, *input_hash;
@@ -19,9 +32,15 @@ struct kraidoc_report_context {
    void (*write_context)(FILE *, const void *, const char *);
 };
 
+static inline bool
+kraidoc_arch_supported(unsigned arch)
+{
+   return (arch >= 9 && arch <= 11) || arch == 15;
+}
+
 bool kraidoc_write_report(FILE *, bool, bool,
                           const struct kraidoc_report_context *,
-                          const struct panvk_shader *);
+                          const struct kraidoc_variant *, unsigned);
 bool kraidoc_write_list(FILE *, bool);
 bool kraidoc_write_info(FILE *, bool, uint64_t, uint32_t);
 

@@ -44,7 +44,33 @@ int kbase_kmod_csf_group_create(struct pan_kmod_dev *dev,
                                 uint32_t cs_queue_count,
                                 bool tiler_oom_handler,
                                 uint32_t max_cores,
+                                uint64_t dvs_buf,
+                                bool compute_priority,
                                 uint32_t *group_handle);
+int kbase_kmod_csf_group_create_with_uid(struct pan_kmod_dev *dev,
+                                uint32_t cs_queue_count,
+                                bool tiler_oom_handler,
+                                uint32_t max_cores,
+                                uint64_t dvs_buf,
+                                bool compute_priority,
+                                uint32_t *group_handle, uint32_t *group_uid);
+int kbase_kmod_csf_group_create_with_neural(struct pan_kmod_dev *dev,
+                                uint32_t cs_queue_count,
+                                bool tiler_oom_handler,
+                                uint32_t max_cores,
+                                uint64_t dvs_buf,
+                                bool compute_priority,
+                                bool neural,
+                                uint32_t *group_handle, uint32_t *group_uid);
+bool kbase_kmod_csf_has_neural(const struct pan_kmod_dev *dev);
+uint32_t kbase_kmod_csf_neural_core_count(const struct pan_kmod_dev *dev);
+struct kbase_kmod_l2_cache_props {
+   uint32_t line_size;
+   uint32_t size_per_slice;
+   uint32_t slices;
+};
+bool kbase_kmod_get_l2_cache_props(const struct pan_kmod_dev *dev,
+                                 struct kbase_kmod_l2_cache_props *props);
 void kbase_kmod_csf_group_destroy(struct pan_kmod_dev *dev,
                                   uint32_t group_handle);
 
@@ -54,6 +80,10 @@ struct kbase_kmod_csf_user_io {
    uint8_t *input;
    uint8_t *output;
 };
+
+#define CS_USER_IO_INPUT_CS_INSERT   0x0
+#define CS_USER_IO_OUTPUT_CS_EXTRACT 0x0
+#define CS_USER_IO_OUTPUT_CS_ACTIVE  0x8
 
 /* Registers and binds the ring buffer at ringbuf_va and maps its USER_IO
  * pages.  From CSF uAPI 1.35 the input and output pages are shared by the
@@ -101,7 +131,6 @@ int kbase_kmod_csf_tiler_heap_create(struct pan_kmod_dev *dev,
                                      uint32_t initial_chunks,
                                      uint32_t max_chunks,
                                      uint32_t target_in_flight,
-                                     uint32_t mem_group_id,
                                      uint64_t *heap_ctx_va,
                                      uint64_t *first_chunk_va);
 void kbase_kmod_csf_tiler_heap_destroy(struct pan_kmod_dev *dev,

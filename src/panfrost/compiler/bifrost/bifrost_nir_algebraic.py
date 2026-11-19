@@ -144,23 +144,33 @@ for cond in ['ilt', 'ige', 'ieq', 'ine', 'ult', 'uge']:
 # Because this lowering must happen late, NIR won't squash inot in
 # automatically. Do so explicitly. (The more specific pattern must be first.)
 for fsz in [16, 32]:
-    upcast = (f'i2i{fsz}', a)
-    downcast = a if fsz == 32 else (f'u2u{fsz}', a)
-
-    algebraic_late += [
-        ((f'b2f{fsz}', ('inot', f'a@32')), ('bcsel_pan', downcast, 0.0, 1.0)),
-        ((f'b2f{fsz}', ('inot', a)), ('bcsel_pan', upcast, 0.0, 1.0)),
-        ((f'b2f{fsz}', f'a@32'), ('bcsel_pan', downcast, 1.0, 0.0)),
-        ((f'b2f{fsz}', a), ('bcsel_pan', upcast, 1.0, 0.0)),
-    ]
-
-for isz in [8, 16, 32]:
-    for bsz in [8, 16, 32]:
-        conv = a if bsz == isz else (f'u2u{isz}' if bsz > isz else f'i2i{isz}', a)
+    for bsz in [8, 16, 32, 64]:
+        if bsz > fsz:
+            bcast = (f'u2u{fsz}', a)
+        elif bsz < fsz:
+            bcast = (f'i2i{fsz}', a)
+        else:
+            bcast = a
 
         algebraic_late += [
-            ((f'b2i{isz}', ('inot', f'a@{bsz}')), ('bcsel_pan', conv, 0, 1), 'is_kraid'),
-            ((f'b2i{isz}', f'a@{bsz}'), ('bcsel_pan', conv, 1, 0), 'is_kraid'),
+            ((f'b2f{fsz}', ('inot', f'a@{bsz}')), ('bcsel_pan', bcast, 0.0, 1.0)),
+            ((f'b2f{fsz}', f'a@{bsz}'), ('bcsel_pan', bcast, 1.0, 0.0)),
+        ]
+
+for isz in [8, 16, 32, 64]:
+    for bsz in [8, 16, 32, 64]:
+        if bsz > isz:
+            bcast = (f'u2u{isz}', a)
+        elif bsz < isz:
+            bcast = (f'i2i{isz}', a)
+        else:
+            bcast = a
+
+        algebraic_late += [
+            ((f'b2i{isz}', ('inot', f'a@{bsz}')),
+             ('bcsel_pan', bcast, 0, 1), 'is_kraid'),
+            ((f'b2i{isz}', f'a@{bsz}'),
+             ('bcsel_pan', bcast, 1, 0), 'is_kraid'),
         ]
 
 LOPS = ['and', 'or', 'xor']
@@ -169,6 +179,30 @@ SHIFTS = [
     ('ushr', 'rshift'),
     ('ishr', 'arshift'),
 ]
+
+algebraic_late += [
+    ((op, ('ishl@32', a, s), ('ushr@32', a, 32 - s)), ('urol', a, s),
+     'is_kraid && gpu_arch >= 15')
+    for op in ['ior', 'ixor', 'iadd'] for s in range(1, 32)
+]
+
+for lop in LOPS:
+    nl = f'i{lop}'
+    psl = f'rshift_{lop}_pan'
+    algebraic_late += [
+        ((nl, ('extract_u16(is_used_once)', 'a@32', 1), b),
+         (psl, a, 16, b), 'is_kraid && gpu_arch >= 15'),
+        ((nl, ('extract_u8(is_used_once)', 'a@32', 3), b),
+         (psl, a, 24, b), 'is_kraid && gpu_arch >= 15'),
+    ]
+
+for (ns, ps), lop in itertools.product(SHIFTS, LOPS):
+    nl = f'i{lop}'
+    algebraic_late += [
+        ((ns, (f'{nl}(is_used_once)', 'a(is_not_uniform_expr)',
+               'b(is_uniform_expr)'), 'c(is_uniform_expr)'),
+         (nl, (ns, a, c), (ns, b, c)), 'is_kraid'),
+    ]
 
 for (ns, ps), lop in itertools.product(SHIFTS, LOPS):
     nl = f'i{lop}'
@@ -260,6 +294,23 @@ algebraic_late += [
 ]
 
 
+uniform_reassoc = [
+    (('~fmul', ('fadd(is_used_once)', 'a(is_not_uniform_expr)', 'b(is_uniform_expr)'), 'c(is_uniform_expr)'),
+     ('ffma', a, c, ('fmul', b, c))),
+    (('~fmul', ('ffma(is_used_once)', 'a(is_not_uniform_expr)', 'b(is_uniform_expr)', 'c(is_uniform_expr)'), 'd(is_uniform_expr)'),
+     ('ffma', a, ('fmul', b, d), ('fmul', c, d))),
+    (('~fmul', ('fmul(is_used_once)', 'a(is_not_uniform_expr)', 'b(is_uniform_expr)'), 'c(is_uniform_expr)'),
+     ('fmul', a, ('fmul', b, c))),
+    (('~ffma', ('fadd(is_used_once)', 'a(is_not_uniform_expr)', 'b(is_uniform_expr)'), 'c(is_uniform_expr)', 'd(is_uniform_expr)'),
+     ('ffma', a, c, ('ffma', b, c, d))),
+    (('~ffma', ('fmul(is_used_once)', 'a(is_not_uniform_expr)', 'b(is_uniform_expr)'), 'c(is_uniform_expr)', d),
+     ('ffma', a, ('fmul', b, c), d)),
+    (('~fadd', ('fadd(is_used_once)', 'a(is_not_uniform_expr)', 'b(is_uniform_expr)'), 'c(is_uniform_expr)'),
+     ('fadd', a, ('fadd', b, c))),
+    (('~fadd', ('ffma(is_used_once)', 'a(is_not_uniform_expr)', 'b(is_uniform_expr)', 'c(is_uniform_expr)'), 'd(is_uniform_expr)'),
+     ('ffma', a, b, ('fadd', c, d))),
+]
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('-p', '--import-path', required=True)
@@ -278,6 +329,8 @@ def run():
     print(nir_algebraic.AlgebraicPass("bifrost_nir_opt_fp16",
                                       algebraic_fp16,
                                       [("bool ", "is_kraid")]).render())
+    print(nir_algebraic.AlgebraicPass("bifrost_nir_opt_uniform_reassoc",
+                                      uniform_reassoc).render())
     print(nir_algebraic.AlgebraicPass("bifrost_nir_lower_algebraic_late",
                                       algebraic_late,
                                       [

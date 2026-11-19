@@ -189,7 +189,8 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
          shader, phys_dev, &dim, &task_axis, &task_increment);
    }
    cs_trace_run_compute(b, tracing_ctx, cs_scratch_reg_tuple(b, 0, 4),
-                        task_increment, task_axis, PANVK_PRECOMP_RES_SEL);
+                        task_increment, task_axis, PANVK_PRECOMP_RES_SEL,
+                        false);
 
    if (barrier & PANLIB_BARRIER_CSF_SYNC)
       panvk_per_arch(cmd_signal_barrier)(cmdbuf, PANVK_CSF_BARRIER_SYNC);

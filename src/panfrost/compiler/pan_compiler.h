@@ -12,6 +12,7 @@
 
 #include "compiler/nir/nir_defines.h"
 #include "compiler/shader_enums.h"
+#include "panfrost/model/pan_model.h"
 #include "util/bitset.h"
 #include "util/u_dynarray.h"
 #include "util/format/u_formats.h"
@@ -19,6 +20,9 @@
 
 struct pan_shader_info;
 struct pan_compile_preamble;
+struct pan_fau_virtual;
+
+#define PAN_MAX_PUSH 256
 
 static inline uint32_t
 pan_loop_weight(unsigned depth)
@@ -43,6 +47,7 @@ struct pan_compile_inputs {
    uint32_t gpu_variant;
    bool is_blend, is_blit;
    bool no_idvs;
+   bool screen_space_position;
    uint32_t view_mask;
 
    /* Number of colour buffers gl_FragColor broadcasts to.  Only useful for
@@ -59,6 +64,8 @@ struct pan_compile_inputs {
    /* Varying layout in memory, if known */
    const struct pan_varying_layout *varying_layout;
 
+   uint8_t fixed_function_blend;
+
    /* Settings to move constants into the FAU. */
    struct {
       /* Driver-reserved range at the start of the FAU */
@@ -72,6 +79,8 @@ struct pan_compile_inputs {
       bool push_ubo_handles;
       /* Whether the backend may promote immediates into the FAU */
       bool promote_immediates;
+      struct pan_fau_virtual *virt;
+      BITSET_DECLARE(pilot_volatile, PAN_MAX_PUSH);
    } fau;
 
    bool instrument;
@@ -154,18 +163,6 @@ enum pan_special_varying {
 
 enum { PAN_VERTEX_ID = 16, PAN_INSTANCE_ID = 17, PAN_MAX_ATTRIBUTE };
 
-/* Architecturally, Bifrost/Valhall can address 128 FAU slots of 64-bits each.
- * In practice, the maximum number of FAU slots is limited by implementation.
- * All known Bifrost and Valhall devices limit to 64 FAU slots. Therefore the
- * maximum number of 32-bit words is 128, since there are 2 words per FAU slot.
- *
- * Midgard can push at most 92 words, so this bound suffices. The Midgard
- * compiler pushes less than this, as Midgard uses register-mapped uniforms
- * instead of FAU, preventing large numbers of uniforms to be pushed for
- * nontrivial programs.
- */
-#define PAN_MAX_PUSH 128
-
 /* Architectural invariants (Midgard and Bifrost): UBO must be <= 2^16 bytes so
  * an offset to a word must be < 2^16. There are less than 2^8 UBOs */
 
@@ -182,6 +179,7 @@ union pan_fau_entry {
 struct pan_fau_layout {
    union pan_fau_entry words[PAN_MAX_PUSH];
    BITSET_DECLARE(is_const, PAN_MAX_PUSH);
+   BITSET_DECLARE(is_pilot, PAN_MAX_PUSH);
 
    /* FAU space reserved by the driver, in units of 32-bit words.
     * This always goes at the start of the FAU and its contents are
@@ -230,7 +228,68 @@ pan_fau_emit_reloc(struct pan_fau_layout *fau, struct pan_ubo_relocation reloc)
 
 #define pan_fau_foreach_reloc(fau, i)                                          \
    for (unsigned i = (fau)->reserved; i < (fau)->count; ++i)                   \
-      if (!BITSET_TEST((fau)->is_const, i))
+      if (!BITSET_TEST((fau)->is_const, i) && !BITSET_TEST((fau)->is_pilot, i))
+
+#define PAN_FAU_VIRTUAL_WORDS (4 * PAN_MAX_PUSH)
+
+enum pan_fau_value_source {
+   PAN_FAU_VALUE_PILOT,
+   PAN_FAU_VALUE_UBO,
+};
+
+struct pan_fau_value {
+   uint16_t word;
+   uint8_t size;
+   uint8_t align;
+   uint8_t source;
+   int16_t alias;
+   struct pan_ubo_relocation ubo;
+   uint32_t handle;
+   bool loadable;
+};
+
+struct pan_fau_virtual {
+   unsigned word_count;
+   unsigned value_count;
+   struct pan_fau_value values[PAN_FAU_VIRTUAL_WORDS / 2];
+   uint16_t value_of[PAN_FAU_VIRTUAL_WORDS];
+   int16_t map[PAN_FAU_VIRTUAL_WORDS];
+   bool placed;
+};
+
+static inline unsigned
+pan_fau_virtual_add(struct pan_fau_virtual *virt, unsigned size,
+                    unsigned align, enum pan_fau_value_source source,
+                    struct pan_ubo_relocation ubo)
+{
+   assert(virt->value_count < PAN_FAU_VIRTUAL_WORDS / 2);
+   unsigned word = ALIGN_POT(virt->word_count, MAX2(align, 2));
+   assert(word + size <= PAN_FAU_VIRTUAL_WORDS);
+   unsigned index = virt->value_count++;
+   virt->values[index] = (struct pan_fau_value){
+      .word = word,
+      .size = size,
+      .align = align,
+      .source = source,
+      .alias = -1,
+      .ubo = ubo,
+   };
+   for (unsigned w = 0; w < size; w++)
+      virt->value_of[word + w] = index;
+   virt->word_count = ALIGN_POT(word + size, 2);
+   return index;
+}
+
+static inline unsigned
+pan_fau_virtual_words(const struct pan_fau_virtual *virt)
+{
+   unsigned words = 0;
+   for (unsigned i = 0; i < virt->value_count; i++) {
+      if (virt->values[i].alias < 0)
+         words += virt->values[i].size;
+   }
+   return words;
+}
 
 #define pan_fau_foreach_imm(fau, i)                                            \
    for (unsigned i = (fau)->reserved; i < (fau)->count; ++i)                   \
@@ -456,6 +515,8 @@ struct pan_shader_info {
    unsigned work_reg_count;
    unsigned tls_size;
    unsigned wls_size;
+   bool contains_jump_ex;
+   unsigned rt_frame_size;
 
    struct pan_stats stats, stats_idvs_varying;
 
@@ -477,8 +538,10 @@ struct pan_shader_info {
          bool early_fragment_tests;
          bool can_early_z, can_fpk;
          bool untyped_color_outputs;
+         uint8_t fixed_function_blend;
          struct {
             bool ld_tile;
+            bool ld_tile_lane_local;
             bool wait_or_tile_access_before_atest_zsemit;
             bool rasterizer_coverage_read;
             bool centroid_interpolation;
@@ -494,6 +557,9 @@ struct pan_shader_info {
           * more than just point size.
           */
          bool needs_extended_fifo;
+
+         uint8_t clip_distance_count;
+         uint8_t cull_distance_count;
 
          /* If the primary shader writes point size, the Valhall
           * driver may need a variant that does not write point

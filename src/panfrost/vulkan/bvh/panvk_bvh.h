@@ -30,6 +30,7 @@
 #define PANVK_BVH_CHILD_EMPTY    0xc0
 
 #define PANVK_BVH_LEAF_OPAQUE   0x01
+#define PANVK_BVH_LEAF_OPAQUE_B 0x02
 #define PANVK_BVH_LEAF_IN_ORDER 0x04
 
 #define PANVK_BVH_INSTANCE_AABBS 0x8000000000000000ul
@@ -52,7 +53,8 @@ struct panvk_bvh_header {
    uint64_t omm_handles_offset;
    uint64_t serialization_size;
    uint64_t instance_count;
-   uint32_t reserved1[10];
+   uint32_t parents_offset;
+   uint32_t reserved1[9];
 };
 
 struct panvk_bvh_box_node {
@@ -93,6 +95,26 @@ struct panvk_bvh_instance_extra {
    uint32_t instance_id;
 };
 
+#define PANVK_ENCODE_STATE_HW        1
+#define PANVK_ENCODE_STATE_COLLAPSED 2
+
+#define PANVK_ENCODE_PASS_COLLAPSE 0
+#define PANVK_ENCODE_PASS_COUNT    1
+#define PANVK_ENCODE_PASS_WRITE    2
+
+struct panvk_encode_node {
+   uint32_t state;
+   uint32_t parent;
+   uint32_t boxes;
+   uint32_t leaves;
+   uint32_t ready;
+   uint32_t placed;
+   uint32_t box_index;
+   uint32_t first_box;
+   uint32_t first_leaf;
+   uint32_t pad[3];
+};
+
 #ifdef VULKAN
 TYPE(panvk_bvh_header, 8);
 TYPE(panvk_bvh_box_node, 4);
@@ -100,16 +122,34 @@ TYPE(panvk_bvh_triangle_leaf, 4);
 TYPE(panvk_bvh_aabb_leaf, 4);
 TYPE(panvk_bvh_instance_leaf, 8);
 TYPE(panvk_bvh_instance_extra, 4);
+TYPE(panvk_encode_node, 4);
 #endif
 
 struct panvk_encode_args {
    VOID_REF intermediate_bvh;
    VOID_REF output_bvh;
    REF(vk_ir_header) header;
+   REF(panvk_encode_node) nodes;
    uint32_t leaf_node_count;
    uint32_t leaf_base;
    uint32_t geometry_type;
    uint32_t geometry_count;
+   uint32_t updateable;
+   uint32_t pass;
+   VOID_REF omm_geometries;
+   uint64_t omm_primitive_offset;
+   uint64_t omm_geometry_offset;
+};
+
+#define PANVK_BVH_NO_PARENT 0xffffffff
+
+struct panvk_update_args {
+   VOID_REF bvh;
+   VOID_REF geometries;
+   VOID_REF ready;
+   VOID_REF bounds;
+   uint32_t geometry_type;
+   VOID_REF omm_geometries;
 };
 
 #define PANVK_COPY_MODE_COPY        0
