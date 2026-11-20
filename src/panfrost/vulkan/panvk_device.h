@@ -189,6 +189,16 @@ struct panvk_device {
    bool dvs_enabled;
    struct panvk_dynamic_cache *dynamic_cache;
 
+   /* Device-lost containment latch for the kbase/vdrm backend (atomic,
+    * accessed through p_atomic_*).  A CSG killed by the host firmware
+    * (add_group_fatal_error after in-flight shader work faults on tiler-heap
+    * pages the host shrinker unmapped) is never resurrected, and the vdrm
+    * transport reports the death once (EIO) before going silent.  The first
+    * bounded queue wait that observes no progress latches this flag so every
+    * later submit/wait fails with VK_ERROR_DEVICE_LOST instead of blocking.
+    * Only meaningful with HAVE_PAN_KMOD_KBASE; always zero otherwise. */
+   int kbase_lost;
+
    int drm_fd;
 };
 

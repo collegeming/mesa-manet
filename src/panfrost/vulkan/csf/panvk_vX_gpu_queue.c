@@ -27,6 +27,7 @@
 #include "util/log.h"
 #include "util/os_time.h"
 #include "util/u_atomic.h"
+#include "util/u_debug.h"
 #include "vk_drm_syncobj.h"
 #include "vk_log.h"
 #include "vk_sync.h"
@@ -75,6 +76,14 @@
 #define KBASE_RING_MAX_GPU_WAITS 32
 /* Generous timeout for the synchronous submission model. */
 #define KBASE_WAIT_TIMEOUT_NS  (10ll * 1000000000ll)
+/* Device-lost containment: a killed CSG stops retiring jobs without ever
+ * reporting another error (the vdrm transport latches EIO once, the first
+ * wait consumes it, and the host then stays silent).  Bound every wait by
+ * progress instead: PANVK_KBASE_WAIT_STALLS consecutive
+ * PANVK_KBASE_WAIT_SLICE_MS slices without any ring / seqno movement mean the
+ * group is gone.  Both knobs are env-overridable for field diagnosis. */
+#define KBASE_WAIT_SLICE_DEFAULT_MS 2000
+#define KBASE_WAIT_STALLS_DEFAULT   3
 #define KBASE_SEQNO_LS_COPY_OFFSET       16
 #define KBASE_SEQNO_MARK_PRE_CALL_OFFSET 24
 #define KBASE_SEQNO_MARK_POST_CALL_OFFSET 32
@@ -474,6 +483,79 @@ kbase_init_seqnos(struct panvk_gpu_queue *queue)
    return VK_SUCCESS;
 }
 
+/* --- Device-lost containment ------------------------------------------
+ *
+ * The host kernel kills a CSG on any fatal firmware error
+ * (add_group_fatal_error) and never brings it back: the group stops
+ * retiring jobs, the CSF notification stream goes quiet after reporting the
+ * error once, and the vdrm transport latches EIO on the first failing
+ * request.  Without containment every later vkQueueSubmit/vkQueueWaitIdle
+ * blocks until the app is killed.
+ *
+ * Containment latches the death in the device and fails every subsequent
+ * queue operation with VK_ERROR_DEVICE_LOST, which is the Vulkan signal for
+ * "destroy and recreate the device".  The latch is device-wide because the
+ * DroidVM guest has a single host CSG: a dead group means the whole VM's
+ * graphics context is dead.
+ */
+
+/* Resolve the wait slicing once; every writer stores the same value. */
+static int64_t
+kbase_wait_slice_ns(struct panvk_gpu_queue *queue)
+{
+   int ms = p_atomic_read(&queue->kbase_contain.slice_ms);
+
+   if (!ms) {
+      int64_t v = debug_get_num_option("PANVK_KBASE_WAIT_SLICE_MS",
+                                       KBASE_WAIT_SLICE_DEFAULT_MS);
+      ms = (int)MAX2(v, 250);
+      p_atomic_set(&queue->kbase_contain.slice_ms, ms);
+   }
+
+   return (int64_t)ms * 1000000ll;
+}
+
+static uint32_t
+kbase_wait_stall_limit(struct panvk_gpu_queue *queue)
+{
+   int limit = p_atomic_read(&queue->kbase_contain.stall_limit);
+
+   if (!limit) {
+      int64_t v = debug_get_num_option("PANVK_KBASE_WAIT_STALLS",
+                                       KBASE_WAIT_STALLS_DEFAULT);
+      limit = (int)MAX2(v, 1);
+      p_atomic_set(&queue->kbase_contain.stall_limit, limit);
+   }
+
+   return (uint32_t)limit;
+}
+
+/* True once this queue or the whole kbase device is known dead: either a
+ * previous bounded wait latched it, or the kernel/transport reported a
+ * queue-group error. */
+static bool
+kbase_backend_lost(struct panvk_gpu_queue *queue)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+
+   if (p_atomic_read(&queue->kbase_contain.lost) ||
+       p_atomic_read(&dev->kbase_lost))
+      return true;
+
+   return kbase_kmod_csf_has_error(dev->kmod.dev);
+}
+
+/* Latch the death in both the queue and the device.  Idempotent and safe to
+ * call from the keepalive thread and from submission threads alike. */
+static void
+kbase_latch_device_lost(struct panvk_gpu_queue *queue)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+
+   p_atomic_set(&queue->kbase_contain.lost, 1);
+   p_atomic_set(&dev->kbase_lost, 1);
+}
+
 /* Emit one job into the subqueue ring: cache maintenance, a CALL to the
  * command stream, then a SYNC_ADD64 on the subqueue seqno cell deferred on
  * all scoreboard slots — the same sequence the panthor kernel driver emits
@@ -527,6 +609,12 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    const struct drm_panthor_csif_info *csif_info = panvk_get_csif_props(dev);
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
    const uint32_t entry_max_size = kbase_ring_entry_max_size(wait_count);
+
+   /* A dead group must never receive new ring entries: the ring can never
+    * drain again, so emitting would block in reserve_ring and kicking would
+    * only queue work the firmware will never execute. */
+   if (kbase_backend_lost(queue))
+      return VK_ERROR_DEVICE_LOST;
 
    /* The ring-emission state (insert offset, ring bytes, emitted-job count)
     * is shared with the idle keepalive thread; hold the emission lock from
@@ -926,6 +1014,14 @@ kbase_keepalive_thread(void *data)
       if (p_atomic_read(&queue->kbase_keepalive.stopping))
          break;
 
+      /* Nothing to keep alive once the group is dead: emitting would only
+       * block on a ring that can never drain.  Exit quietly so
+       * vkDestroyDevice's join stays bounded. */
+      if (kbase_backend_lost(queue)) {
+         mesa_logi("kbase: keepalive exiting, queue is lost");
+         break;
+      }
+
       /* Idle decision under the emission lock so it cannot race an
        * in-flight submission's last_emit update; the heartbeat emissions
        * below then serialize per entry through the same lock inside
@@ -1022,6 +1118,15 @@ kbase_subqueue_wait_seqno(struct panvk_gpu_queue *queue, uint32_t subqueue,
    int64_t last_kick = start;
    uint64_t watchdog = (uint64_t)start + KBASE_WAIT_TIMEOUT_NS;
    uint64_t deadline = MIN2(abs_timeout_ns, watchdog);
+   /* Progress-bounded containment: while the queue is alive the firmware
+    * keeps moving CS_EXTRACT and/or the seqno, so a slice without movement
+    * means the CSG stopped.  Latch device-lost after stall_limit such slices
+    * so a killed group is reported in seconds instead of blocking the caller
+    * for the whole watchdog. */
+   const int64_t slice_ns = kbase_wait_slice_ns(queue);
+   const uint32_t stall_limit = kbase_wait_stall_limit(queue);
+   uint32_t stalls = 0;
+   uint64_t slice_deadline = (uint64_t)start + (uint64_t)slice_ns;
    uint32_t last_job_offset = subq->kbase.last_job_offset;
    uint32_t last_last_job_offset = subq->kbase.last_last_job_offset;
    // mesa_logd("kbase: starting subqueue %u job %" PRIu64
@@ -1038,6 +1143,16 @@ kbase_subqueue_wait_seqno(struct panvk_gpu_queue *queue, uint32_t subqueue,
    uint64_t prev_seqno = 0xffffffffffffffffULL;
    int prev_error_type = 0xffffffff;
    while (true) {
+      /* Do not re-block on a group already known to be dead. */
+      if (kbase_backend_lost(queue)) {
+         mesa_loge("kbase: subqueue %u wait aborted, device is lost",
+                   subqueue);
+         kbase_latch_device_lost(queue);
+         return vk_queue_set_lost(&queue->vk,
+                                  "kbase: device lost (subqueue %u)",
+                                  subqueue);
+      }
+
       uint64_t insert = *(volatile uint64_t *)(input_page +
                                                 CS_USER_IO_INPUT_CS_INSERT);
       uint64_t extract = *(volatile uint64_t *)(output_page +
@@ -1048,6 +1163,10 @@ kbase_subqueue_wait_seqno(struct panvk_gpu_queue *queue, uint32_t subqueue,
          (void)active;
          prev_extract = extract;
          prev_seqno = cell->seqno;
+         /* Firmware is still working through this ring: restart the
+          * no-progress window. */
+         stalls = 0;
+         slice_deadline = (uint64_t)os_time_get_nano() + (uint64_t)slice_ns;
       }
       kbase_cache_invalidate_range((const void *)cell, kbase_seqno_stride());
       if (cell->seqno >= target_seqno ||
@@ -1058,6 +1177,7 @@ kbase_subqueue_wait_seqno(struct panvk_gpu_queue *queue, uint32_t subqueue,
       if (cell->error) {
          mesa_loge("kbase: CS error 0x%x on subqueue %u", cell->error,
                    subqueue);
+         kbase_latch_device_lost(queue);
          return vk_queue_set_lost(&queue->vk,
                                   "kbase: CS error 0x%x on subqueue %u",
                                   cell->error, subqueue);
@@ -1075,8 +1195,19 @@ kbase_subqueue_wait_seqno(struct panvk_gpu_queue *queue, uint32_t subqueue,
          last_kick = now;
       }
 
-      if ((uint64_t)now >= deadline) {
-         if (deadline < watchdog)
+      /* Progress-bounded containment: the group is dead once it has spent
+       * stall_limit consecutive slices without moving extract or seqno. */
+      bool stalled = false;
+      if ((uint64_t)now >= slice_deadline) {
+         if (++stalls >= stall_limit)
+            stalled = true;
+         slice_deadline = (uint64_t)now + (uint64_t)slice_ns;
+      }
+
+      if ((uint64_t)now >= deadline || stalled) {
+         /* A caller-supplied timeout shorter than the watchdog is a poll,
+          * not evidence of a dead group — unless progress also stopped. */
+         if (!stalled && deadline < watchdog)
             return VK_TIMEOUT;
 
          const volatile uint64_t *ring = subq->kbase.ringbuf_cpu;
@@ -1085,7 +1216,7 @@ kbase_subqueue_wait_seqno(struct panvk_gpu_queue *queue, uint32_t subqueue,
 
          /* Log directly: on queue-init failures the vk_queue_set_lost
           * message never reaches the user. */
-         mesa_loge("kbase: timeout on subqueue %u: seqno %" PRIu64
+         mesa_loge("kbase: timeout on subqueue %u (stalls %u/%u, %s): seqno %" PRIu64
                    ", ls_copy %" PRIu64 ", target %" PRIu64
                    ", marks pre/post-call/post-wait 0x%" PRIx64
                    "/0x%" PRIx64 "/0x%" PRIx64
@@ -1094,7 +1225,8 @@ kbase_subqueue_wait_seqno(struct panvk_gpu_queue *queue, uint32_t subqueue,
                    ", active %u, error 0x%x"
                    ", ring[0..3] 0x%" PRIx64 "/0x%" PRIx64
                    "/0x%" PRIx64 "/0x%" PRIx64,
-                   subqueue, (uint64_t)cell->seqno, *ls_copy,
+                   subqueue, stalls, stall_limit,
+                   stalled ? "no progress" : "watchdog", (uint64_t)cell->seqno, *ls_copy,
                    target_seqno, *mark_pre_call, *mark_post_call,
                    *mark_post_wait, *stream_progress, target_insert, extract,
                    active, cell->error, ring[0], ring[1], ring[2], ring[3]);
@@ -1164,8 +1296,12 @@ kbase_subqueue_wait_seqno(struct panvk_gpu_queue *queue, uint32_t subqueue,
                                  phys_dev->kmod.dev->props.gpu_id);
          }
 
-         return vk_queue_set_lost(&queue->vk,
-                                  "kbase: timeout on subqueue %u", subqueue);
+         kbase_latch_device_lost(queue);
+         vk_queue_set_lost(&queue->vk,
+                           "kbase: %s on subqueue %u",
+                           stalled ? "no progress, device lost" : "timeout",
+                           subqueue);
+         return VK_ERROR_DEVICE_LOST;
       }
 
       /* Block on a CSF notification (consuming one event when available)
@@ -3684,6 +3820,21 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
    if (vk_queue_is_lost(vk_queue))
       return VK_ERROR_DEVICE_LOST;
 
+#ifdef HAVE_PAN_KMOD_KBASE
+   /* Refuse new work on a dead CSG: the ring can never drain, so submitting
+    * would only block in the ring-reserve wait.  The device-wide latch is
+    * checked too, because the kernel group is shared by every queue. */
+   if (gpu_queue_uses_kbase(to_panvk_device(vk_queue->base.device))) {
+      struct panvk_gpu_queue *queue =
+         container_of(vk_queue, struct panvk_gpu_queue, vk);
+
+      if (kbase_backend_lost(queue)) {
+         kbase_latch_device_lost(queue);
+         return VK_ERROR_DEVICE_LOST;
+      }
+   }
+#endif
+
    if (vk_queue_submit_has_bind(vk_submit)) {
       struct panvk_gpu_queue *queue = container_of(vk_queue, struct panvk_gpu_queue, vk);
       return panvk_queue_vm_bind(vk_queue, vk_submit, queue->syncobj_handle);
@@ -3901,7 +4052,13 @@ panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
        * lock before the potentially long final wait. */
       kbase_keepalive_stop(queue);
       simple_mtx_destroy(&queue->kbase_keepalive.emit_lock);
-      kbase_queue_wait_current(queue, UINT64_MAX);
+      /* On a dead group the drain can never finish: skip it so
+       * vkDestroyDevice returns promptly. */
+      if (kbase_backend_lost(queue))
+         mesa_loge("kbase: %s: device is lost, skipping the final drain",
+                   __func__);
+      else
+         kbase_queue_wait_current(queue, UINT64_MAX);
    }
 #endif
 
@@ -3939,10 +4096,12 @@ panvk_per_arch(gpu_queue_check_status)(struct vk_queue *vk_queue)
     * MEM_SYNC invalidations and reading the GPU-written subqueue contexts on
     * every Vulkan status query. */
    if (gpu_queue_uses_kbase(dev)) {
-      if (kbase_kmod_csf_has_error(dev->kmod.dev)) {
+      /* Once containment latched the death, every later status query must
+       * agree with the failed waits instead of reporting a healthy queue. */
+      if (kbase_backend_lost(queue)) {
+         kbase_latch_device_lost(queue);
          u_printf_with_ctx(stdout, &dev->printf.ctx);
-         return vk_queue_set_lost(&queue->vk,
-                                  "kbase: CSF queue-group error");
+         return vk_queue_set_lost(&queue->vk, "kbase: device lost");
       }
 
       return VK_SUCCESS;

@@ -181,6 +181,22 @@ struct panvk_gpu_queue {
        * emit_lock.  Updated by every kbase_subqueue_emit_job() call. */
       int64_t last_emit_ns;
    } kbase_keepalive;
+
+   /* Device-lost containment.  A CSG killed by the host firmware never
+    * retires another job, so a wait must be bounded in *progress*, not only
+    * in wall-clock time: the seqno wait is cut into
+    * PANVK_KBASE_WAIT_SLICE_MS slices and the queue is declared lost after
+    * PANVK_KBASE_WAIT_STALLS consecutive slices with no ring/seqno movement.
+    * Once written, `lost` is sticky for the device's lifetime — the host
+    * keeps the killed group dead, so retrying would only re-block. */
+   struct {
+      /* Sticky per-queue latch, cross-thread through p_atomic. */
+      int lost;
+      /* Resolved on first use from the env knobs (0 = not resolved yet).
+       * Every writer stores the same value, so plain atomics suffice. */
+      int slice_ms;
+      int stall_limit;
+   } kbase_contain;
 #endif
 
    struct {

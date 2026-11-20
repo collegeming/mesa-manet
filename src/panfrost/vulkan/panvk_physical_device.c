@@ -944,6 +944,13 @@ kbase_cpu_sync_wait_many(struct vk_device *device,
       return VK_SUCCESS;
    }
 
+   /* Device-lost containment: a dead CSG never signals its fences again, so
+    * this poll loop would spin for as long as the caller keeps asking.  Give
+    * it the same kind of hard bound the queue waits use and turn the expiry
+    * into a latched device loss. */
+   const uint64_t start_ns = os_time_get_nano();
+   const uint64_t budget_ns = 10ull * 1000000000ull;
+
    while (true) {
       for (uint32_t i = 0; i < wait_count; i++) {
          struct kbase_cpu_sync *ks =
@@ -954,8 +961,14 @@ kbase_cpu_sync_wait_many(struct vk_device *device,
          if (result != VK_TIMEOUT)
             return result;
       }
-      if (abs_timeout_ns == 0 || os_time_get_nano() >= abs_timeout_ns)
+      if (vk_device_is_lost_no_report(device))
+         return VK_ERROR_DEVICE_LOST;
+      const uint64_t now = os_time_get_nano();
+      if (abs_timeout_ns == 0 || now >= abs_timeout_ns)
          return VK_TIMEOUT;
+      if (now - start_ns >= budget_ns)
+         return vk_device_set_lost(device,
+                                   "kbase: fence wait made no progress");
       sched_yield();
    }
 }
