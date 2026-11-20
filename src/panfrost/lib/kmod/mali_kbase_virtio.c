@@ -268,33 +268,7 @@ int kbv_cpu_sync(const void *ptr, size_t size, uint8_t type)
    }
    pthread_mutex_unlock(&lock);
    if (fd < 0) return 0;
-   /* The host's cmd-12 sync only accepts shared-backing BOs, and CSF
-    * event memory is rejected from shared backing, so the queue BOs can
-    * never use it. Emulate the operation through the generic read/write
-    * RPCs instead: both target the live host mapping of the BO, so
-    * MSYNC pushes the local range to the GPU and CSYNC pulls the GPU's
-    * current contents back. */
-   if (offset > UINT32_MAX || size > UINT32_MAX - offset) { errno = EOVERFLOW; return -1; }
-   for (uint64_t done = 0; done < size;) {
-      size_t chunk = size - done > 1024 ? 1024 : (size_t)(size - done);
-      struct kbv_req q = {
-         .cmd = type == BASE_SYNCSET_OP_MSYNC ? 2 : 3,
-         .handle = handle,
-         .offset = (uint32_t)(offset + done),
-         .size = (uint32_t)chunk,
-      };
-      if (type == BASE_SYNCSET_OP_MSYNC)
-         memcpy(q.data, (const uint8_t *)ptr + done, chunk);
-      struct kbv_rsp r;
-      if (rpc(fd, &q, &r)) return -1;
-      if (type == BASE_SYNCSET_OP_CSYNC) {
-         if (!r.size || r.size > chunk) { errno = EPROTO; return -1; }
-         memcpy((uint8_t *)ptr + done, r.data, r.size);
-         if (r.size < chunk) { errno = EPROTO; return -1; }
-      }
-      done += chunk;
-   }
-   return 1;
+   return kbv_bo_sync(fd, handle, offset, size, type) ? -1 : 1;
 }
 static int queue_rpc(int fd, uint32_t op, uint64_t va, uint32_t csi,
                       uint32_t size, uint32_t group, struct kbv_rsp *r)
@@ -355,13 +329,25 @@ void kbv_queue_term(int fd, uint64_t va, struct kbase_kmod_csf_user_io *io)
 }
 int kbv_queue_kick(int fd, uint64_t va)
 {
-   if (kbv_has_error(fd)) return -1;
+   /* A latched context error no longer blocks kicks: a fatal firmware
+    * group event would still surface through kbv_wait_event below, while
+    * blocking kicks here turned any transient event into a permanent
+    * wedge (rekicks became no-ops forever). */
    struct kbv_rsp r;
    return latch_error(fd, queue_rpc(fd, 2, va, 0, 0, 0, &r));
 }
 int kbv_wait_event(int fd, int64_t timeout_ns)
 {
-   if (kbv_has_error(fd)) return -1;
+   /* Consume a latched error once so the caller observes it, then let
+    * later waits poll the host again: a fatal group error keeps coming
+    * back from the event page, while a transient one lets the queue
+    * recover instead of wedging the context forever. */
+   pthread_mutex_lock(&lock);
+   struct kbv_ctx *ctx = lookup(fd);
+   int latched = ctx && ctx->error;
+   if (ctx) ctx->error = 0;
+   pthread_mutex_unlock(&lock);
+   if (latched) return -1;
    uint32_t ms = timeout_ns < 0 || timeout_ns > 20000000 ? 20 : (timeout_ns + 999999) / 1000000;
    struct kbv_rsp r;
    return latch_error(fd, queue_rpc(fd, 3, 0, 0, ms, 0, &r));
