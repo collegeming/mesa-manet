@@ -1477,6 +1477,7 @@ fail:
 static void
 get_kbase_drm_device_ids(struct panvk_physical_device *device)
 {
+#ifndef _WIN32
    struct stat fd_st, node_st;
    drmDevicePtr drm_device;
 
@@ -1494,6 +1495,10 @@ get_kbase_drm_device_ids(struct panvk_physical_device *device)
    }
 
    drmFreeDevice(&drm_device);
+#else
+   /* The Windows vdrm transport has no DRM node identity to mirror. */
+   (void)device;
+#endif
 }
 
 VkResult

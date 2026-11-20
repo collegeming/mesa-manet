@@ -2,6 +2,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#ifdef _WIN32
+#ifndef O_NONBLOCK
+#define O_NONBLOCK 0x4000
+#endif
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+#endif
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>

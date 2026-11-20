@@ -1824,6 +1824,11 @@ kbase_kmod_bo_alloc_dmabuf(struct pan_kmod_dev *dev, uint64_t size,
  * forward the rest to the regular allocator (CAPTURE_REPLAY is silently
  * dropped by to_kbase_mem_flags). */
 static struct pan_kmod_bo *
+kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
+                    struct pan_kmod_vm *exclusive_vm, uint64_t size,
+                    uint32_t kmod_flags);
+
+static struct pan_kmod_bo *
 kbase_kmod_bo_alloc_at(struct pan_kmod_dev *dev,
                        struct pan_kmod_vm *exclusive_vm, uint64_t size,
                        uint32_t kmod_flags, uint64_t va)

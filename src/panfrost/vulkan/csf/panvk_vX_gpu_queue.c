@@ -39,6 +39,7 @@
 #include <unistd.h>
 #include "kmod/kbase_kmod.h"
 #include "kmod/kbase_virtio.h"
+#include "drm-uapi/mali_kbase_ioctl.h"
 #endif
 
 #define MIN_DESC_TRACEBUF_SIZE (128 * 1024)

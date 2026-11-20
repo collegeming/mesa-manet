@@ -79,7 +79,11 @@ panvk_per_arch(get_physical_device_extensions)(
    *ext = (struct vk_device_extension_table){
       .MTK_dynamic_cache_memory = PAN_ARCH == 15 &&
          device->kbase_node_path[0] && sizeof(void *) == 8 &&
+#ifdef _WIN32
+         false, /* no /dev/gpu_pdma node on the Windows transport */
+#else
          access("/dev/gpu_pdma", R_OK | W_OK) == 0,
+#endif
       .KHR_8bit_storage = true,
       .KHR_16bit_storage = true,
       .KHR_acceleration_structure = PAN_ARCH >= 15,
