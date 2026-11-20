@@ -80,6 +80,14 @@ libpanvk_files = files(
 )
 libpanvk_files += [sha1_h]
 
+if not prog_glslang.found()
+  # The common BVH runtime (vk_acceleration_structure.c) is only built when
+  # glslang is available; panvk_physical_device.c references
+  # vk_acceleration_struct_vtx_format_supported unconditionally, so provide
+  # the self-contained helper here on targets without glslang.
+  libpanvk_files += files('panvk_win32_accel_stub.c')
+endif
+
 panvk_deps = []
 panvk_flags = []
 panvk_per_arch_libs = []
