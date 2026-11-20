@@ -530,23 +530,50 @@ kbase_wait_stall_limit(struct panvk_gpu_queue *queue)
    return (uint32_t)limit;
 }
 
-/* True once this queue or the whole kbase device is known dead: either a
+/* Process-wide death latch.  The guest owns exactly one host CSG and every
+ * kbase context in this process submits into it, so a group that died is dead
+ * for every panvk_device, not only for the one whose wait noticed.  This
+ * matters because the transport latches its error per context fd: when the
+ * first context gets EIO, a second device's kmod fd still looks healthy, its
+ * submission into the same dead group returns VK_SUCCESS, and the fence it
+ * waits on can never be retired -- which is a hang no per-device check can
+ * see. */
+static int kbase_lost_global;
+
+/* One line, not one per submission, when work is refused after the death. */
+static int kbase_reject_logged;
+
+/* Device-level view: the process latch, this device's own latch, or a report
+ * from the kernel/transport.  A transport report is promoted into the latches
+ * so later checks are cheap and every device agrees. */
+static bool
+kbase_dev_lost(struct panvk_device *dev)
+{
+   if (p_atomic_read(&kbase_lost_global) || p_atomic_read(&dev->kbase_lost))
+      return true;
+
+   if (!kbase_kmod_csf_has_error(dev->kmod.dev))
+      return false;
+
+   p_atomic_set(&dev->kbase_lost, 1);
+   p_atomic_set(&kbase_lost_global, 1);
+   return true;
+}
+
+/* True once this queue or the whole kbase backend is known dead: either a
  * previous bounded wait latched it, or the kernel/transport reported a
  * queue-group error. */
 static bool
 kbase_backend_lost(struct panvk_gpu_queue *queue)
 {
-   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-
-   if (p_atomic_read(&queue->kbase_contain.lost) ||
-       p_atomic_read(&dev->kbase_lost))
+   if (p_atomic_read(&queue->kbase_contain.lost))
       return true;
 
-   return kbase_kmod_csf_has_error(dev->kmod.dev);
+   return kbase_dev_lost(to_panvk_device(queue->vk.base.device));
 }
 
-/* Latch the death in both the queue and the device.  Idempotent and safe to
- * call from the keepalive thread and from submission threads alike. */
+/* Latch the death in the queue, the device and the process.  Idempotent and
+ * safe to call from the keepalive thread and from submission threads alike. */
 static void
 kbase_latch_device_lost(struct panvk_gpu_queue *queue)
 {
@@ -554,6 +581,7 @@ kbase_latch_device_lost(struct panvk_gpu_queue *queue)
 
    p_atomic_set(&queue->kbase_contain.lost, 1);
    p_atomic_set(&dev->kbase_lost, 1);
+   p_atomic_set(&kbase_lost_global, 1);
 }
 
 /* Emit one job into the subqueue ring: cache maintenance, a CALL to the
@@ -1015,6 +1043,12 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
  * grace pass so a group that is still coming up is not misread, and a line
  * of "keepalive tick target/extract/space" every 5 s records that the thread
  * is still running and where it stopped if it is not.
+ *
+ * The death latch is process-wide, not per device: the guest owns one host
+ * CSG, so a group that one context saw die is dead for every context in the
+ * process.  The thread itself keeps ticking after the death and only stops at
+ * vkDestroyDevice, so the trace above stays the proof that the thread is
+ * alive while the application is the thing that wedged.
  */
 #define KBASE_KEEPALIVE_DEFAULT_MS 300
 /* Poll slice: keeps thread shutdown responsive without a condvar. */
@@ -1086,10 +1120,21 @@ kbase_keepalive_emit(struct panvk_gpu_queue *queue, uint64_t *targets,
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
       targets[i] = 0;
 
+   /* Lockless look first: a ring that is already out of space is the common
+    * stall, and queueing for the emission lock behind the thread that is
+    * itself stuck in the ring-reserve wait would hide it. */
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      if (queue->subqueues[i].kbase.ringbuf_bo &&
+          kbase_subqueue_ring_free(queue, i, entry_max_size) == 0)
+         return VK_TIMEOUT;
+   }
+
    simple_mtx_lock(&queue->kbase_keepalive.emit_lock);
 
    VkResult result = VK_SUCCESS;
 
+   /* Re-check under the lock: this one is authoritative, because a real
+    * submission may have taken the space in between. */
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       if (queue->subqueues[i].kbase.ringbuf_bo &&
           kbase_subqueue_ring_free(queue, i, entry_max_size) == 0) {
@@ -1179,6 +1224,8 @@ static void
 kbase_keepalive_diag(struct panvk_gpu_queue *queue, const uint64_t *pending,
                      bool pending_valid)
 {
+   const bool lost = kbase_backend_lost(queue);
+
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       struct panvk_subqueue *subq = &queue->subqueues[i];
 
@@ -1190,15 +1237,19 @@ kbase_keepalive_diag(struct panvk_gpu_queue *queue, const uint64_t *pending,
                                  CS_USER_IO_OUTPUT_CS_EXTRACT);
 
       mesa_logi("kbase: keepalive tick target=%" PRIu64 " extract=%" PRIu64
-                " space=%" PRIu64 " sq=%u",
+                " space=%" PRIu64 " sq=%u%s",
                 pending_valid ? pending[i] : subq->kbase.emitted_jobs,
                 extract,
                 kbase_subqueue_ring_free(queue, i,
                                          kbase_ring_entry_max_size(0)),
-                i);
+                i, lost ? " (lost)" : "");
       /* One line per tick is enough to prove the thread is alive. */
       return;
    }
+
+   /* No subqueue has a ring: still print, so an empty trace means a thread
+    * that stopped and not a queue that never had anything to report. */
+   mesa_logi("kbase: keepalive tick no rings%s", lost ? " (lost)" : "");
 }
 
 static int
@@ -1219,6 +1270,8 @@ kbase_keepalive_thread(void *data)
     * up, and a miss on the first probe is not evidence of a wedge. */
    bool probe_grace = probe_ms > 0;
    uint32_t strikes = 0;
+   /* Log the death once; the ticks themselves stay quiet afterwards. */
+   bool lost_logged = false;
 
    while (!p_atomic_read(&queue->kbase_keepalive.stopping)) {
       os_time_sleep(MIN2(KBASE_KEEPALIVE_SLICE_MS, interval_ms) * 1000);
@@ -1226,19 +1279,25 @@ kbase_keepalive_thread(void *data)
       if (p_atomic_read(&queue->kbase_keepalive.stopping))
          break;
 
-      /* Nothing to keep alive once the group is dead: emitting would only
-       * block on a ring that can never drain.  Exit quietly so
-       * vkDestroyDevice's join stays bounded. */
-      if (kbase_backend_lost(queue)) {
-         mesa_logi("kbase: keepalive exiting, queue is lost");
-         break;
-      }
-
       const int64_t now = os_time_get_nano();
 
       if (now - last_diag_ns >= KBASE_KEEPALIVE_DIAG_NS) {
          last_diag_ns = now;
          kbase_keepalive_diag(queue, pending, pending_valid);
+      }
+
+      /* Nothing may be emitted once the group is dead, but the thread keeps
+       * ticking instead of exiting: the trace above is then the only proof
+       * that the thread itself is still alive, which is what the next log
+       * reader needs to tell a stuck keepalive from a stuck application.
+       * vkDestroyDevice stops it through `stopping`. */
+      if (kbase_backend_lost(queue)) {
+         if (!lost_logged) {
+            lost_logged = true;
+            mesa_logi("kbase: keepalive: device is lost, ticks continue "
+                      "without emitting");
+         }
+         continue;
       }
 
       /* Probe before emitting: the probe is the only thing that can see a
@@ -1257,9 +1316,16 @@ kbase_keepalive_thread(void *data)
                strikes = 0;
                pending_valid = false;
             } else if (pres != VK_TIMEOUT) {
-               mesa_loge("kbase: keepalive probe failed (VkResult %d); "
-                         "stopping the keepalive thread", (int)pres);
-               break;
+               /* The probe wait itself reported a dead backend (for example
+                * another thread already latched the loss).  Latch and keep
+                * ticking rather than going silent. */
+               kbase_keepalive_diag(queue, pending, true);
+               mesa_loge("kbase: keepalive probe failed (VkResult %d), "
+                         "device lost", (int)pres);
+               kbase_latch_device_lost(queue);
+               vk_queue_set_lost(&queue->vk,
+                                 "kbase: keepalive probe failed");
+               continue;
             } else {
                strikes++;
                if (strikes >= KBASE_KEEPALIVE_PROBE_STRIKES) {
@@ -1271,7 +1337,9 @@ kbase_keepalive_thread(void *data)
                   kbase_latch_device_lost(queue);
                   vk_queue_set_lost(&queue->vk,
                                     "kbase: keepalive probe timed out");
-                  break;
+                  /* Keep ticking: the trace is how the next log tells an
+                   * idle-but-alive thread from a dead process. */
+                  continue;
                }
 
                mesa_logw("kbase: keepalive probe timed out (%u/%u), the "
@@ -1314,9 +1382,12 @@ kbase_keepalive_thread(void *data)
       }
 
       if (result != VK_TIMEOUT) {
-         mesa_loge("kbase: keepalive emission failed (queue likely lost); "
-                   "stopping the keepalive thread");
-         break;
+         kbase_keepalive_diag(queue, pending, pending_valid);
+         mesa_loge("kbase: keepalive emission failed (VkResult %d), "
+                   "device lost", (int)result);
+         kbase_latch_device_lost(queue);
+         vk_queue_set_lost(&queue->vk, "kbase: keepalive emission failed");
+         continue;
       }
 
       /* No ring space, or an emission lock that stayed held for the whole
@@ -1327,7 +1398,8 @@ kbase_keepalive_thread(void *data)
          mesa_loge("kbase: keepalive emit stalled, device lost");
          kbase_latch_device_lost(queue);
          vk_queue_set_lost(&queue->vk, "kbase: keepalive emit stalled");
-         break;
+         /* Same as above: latch, then keep the tick trace running. */
+         continue;
       }
 
       mesa_logw("kbase: keepalive emit stalled (%u/%u): no ring space or a "
@@ -4120,7 +4192,16 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
 
       if (kbase_backend_lost(queue)) {
          kbase_latch_device_lost(queue);
-         return VK_ERROR_DEVICE_LOST;
+         /* Continuous submitters (DWM, the D2D soak) would otherwise print
+          * this on every frame; the rejection itself is the signal. */
+         if (!p_atomic_read(&kbase_reject_logged)) {
+            p_atomic_set(&kbase_reject_logged, 1);
+            mesa_loge("kbase: submission refused, device is lost");
+         }
+         /* Mark the queue lost as well so the runtime gates this device's
+          * fence and idle waits from now on instead of sending each one down
+          * into the backend just to be refused there. */
+         return vk_queue_set_lost(&queue->vk, "kbase: device lost");
       }
    }
 #endif
@@ -4257,6 +4338,15 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *dev,
 
 #ifdef HAVE_PAN_KMOD_KBASE
    if (uses_kbase) {
+      /* A dead CSG cannot carry a new ring: the group is shared by every
+       * context in the process, so a device created after the death would
+       * only produce the illusion of success and fail on its first draw. */
+      if (kbase_dev_lost(dev)) {
+         mesa_loge("kbase: create_gpu_queue on a lost device");
+         result = VK_ERROR_DEVICE_LOST;
+         goto err_finish_queue;
+      }
+
       result = kbase_create_group(queue, shader_core_count);
       if (result != VK_SUCCESS)
          goto err_destroy_syncobj;
@@ -4345,7 +4435,7 @@ panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
       /* On a dead group the drain can never finish: skip it so
        * vkDestroyDevice returns promptly. */
       if (kbase_backend_lost(queue))
-         mesa_loge("kbase: %s: device is lost, skipping the final drain",
+         mesa_logi("kbase: %s: device is lost, skipping the final drain",
                    __func__);
       else
          kbase_queue_wait_current(queue, UINT64_MAX);
