@@ -595,11 +595,41 @@ kbase_subqueue_reserve_ring(struct panvk_gpu_queue *queue,
    return VK_SUCCESS;
 }
 
+/* Free bytes left in the subqueue ring for an entry of `entry_max_size`,
+ * using the same straddle accounting as the reservation.  Callers that must
+ * not enter the reservation's blocking seqno wait (the keepalive liveness
+ * probe) use this to decide whether an emission can proceed at all. */
+static uint64_t
+kbase_subqueue_ring_free(struct panvk_gpu_queue *queue, uint32_t subqueue,
+                         uint32_t entry_max_size)
+{
+   struct panvk_subqueue *subq = &queue->subqueues[subqueue];
+   const uint8_t *output_page = subq->kbase.user_io.output;
+   uint64_t extract = *(volatile uint64_t *)(output_page +
+                                             CS_USER_IO_OUTPUT_CS_EXTRACT);
+   uint32_t offset = subq->kbase.insert % KBASE_RINGBUF_SIZE;
+   uint64_t required = entry_max_size;
+
+   if (offset + entry_max_size > KBASE_RINGBUF_SIZE)
+      required += KBASE_RINGBUF_SIZE - offset;
+
+   uint64_t used = subq->kbase.insert - extract;
+
+   if (used + required > KBASE_RINGBUF_SIZE)
+      return 0;
+
+   return KBASE_RINGBUF_SIZE - used;
+}
+
 DEBUG_GET_ONCE_BOOL_OPTION(panvk_csf_opt_ring_tail, "PANVK_CSF_OPT_RING_TAIL",
                            PAN_ARCH >= 15)
 
+/* Emit one job into `subqueue`.  The caller must hold
+ * queue->kbase_keepalive.emit_lock: reservation may block on a full ring
+ * (seqno wait), so entries have to serialize in ring order and the ring
+ * state must not change between reservation and accounting. */
 static VkResult
-kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
+kbase_subqueue_emit_job_locked(struct panvk_gpu_queue *queue, uint32_t subqueue,
                         uint64_t stream_addr, uint32_t stream_size,
                         uint32_t flush_id, uint64_t gpu_id,
                         const struct panvk_kbase_gpu_wait *waits,
@@ -616,20 +646,10 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    if (kbase_backend_lost(queue))
       return VK_ERROR_DEVICE_LOST;
 
-   /* The ring-emission state (insert offset, ring bytes, emitted-job count)
-    * is shared with the idle keepalive thread; hold the emission lock from
-    * reservation until the new entry is fully accounted for.  Reservation
-    * may block on a full ring (seqno wait), so entries serialize in ring
-    * order under this lock, mirroring the panthor kernel's own ring
-    * serialization.  The lock is only taken on the kbase path. */
-   simple_mtx_lock(&queue->kbase_keepalive.emit_lock);
-
    VkResult result =
       kbase_subqueue_reserve_ring(queue, subqueue, entry_max_size);
-   if (result != VK_SUCCESS) {
-      simple_mtx_unlock(&queue->kbase_keepalive.emit_lock);
+   if (result != VK_SUCCESS)
       return result;
-   }
 
    uint32_t offset = subq->kbase.insert % KBASE_RINGBUF_SIZE;
 
@@ -834,7 +854,6 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    cs_end(&b);
 
    if (!cs_is_valid(&b)) {
-      simple_mtx_unlock(&queue->kbase_keepalive.emit_lock);
       return panvk_errorf(dev, VK_ERROR_UNKNOWN,
                           "kbase: CS ring emission failed");
    }
@@ -874,8 +893,6 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
     * decision cannot miss a just-started submission. */
    queue->kbase_keepalive.last_emit_ns = os_time_get_nano();
 
-   simple_mtx_unlock(&queue->kbase_keepalive.emit_lock);
-
    mesa_logd("kbase: emitted subqueue %u job %" PRIu64
              ": ring offset %u, entry %u/%u bytes, stream 0x%" PRIx64
              "/%u, flush %u",
@@ -895,6 +912,29 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    }
 
    return VK_SUCCESS;
+}
+
+static VkResult
+kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
+                        uint64_t stream_addr, uint32_t stream_size,
+                        uint32_t flush_id, uint64_t gpu_id,
+                        const struct panvk_kbase_gpu_wait *waits,
+                        uint32_t wait_count, uint8_t cache_frame)
+{
+   /* The ring-emission state (insert offset, ring bytes, emitted-job count)
+    * is shared between submission threads and the idle keepalive thread;
+    * hold the emission lock from reservation until the new entry is fully
+    * accounted for.  Reservation may block on a full ring (seqno wait), so
+    * entries serialize in ring order under this lock, mirroring the panthor
+    * kernel's own ring serialization.  The lock is only taken on the kbase
+    * path. */
+   simple_mtx_lock(&queue->kbase_keepalive.emit_lock);
+   VkResult result = kbase_subqueue_emit_job_locked(
+      queue, subqueue, stream_addr, stream_size, flush_id, gpu_id, waits,
+      wait_count, cache_frame);
+   simple_mtx_unlock(&queue->kbase_keepalive.emit_lock);
+
+   return result;
 }
 
 /* Publish the new insert offset in the USER_IO input page and kick the
@@ -960,13 +1000,21 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
  * wedge can be silent: the host keeps accepting ring entries (so every
  * vkQueueSubmit returns VK_SUCCESS on a ring that still has room) while the
  * firmware consumes nothing, and if the application never waits on its own
- * work there is no other place to notice.  After publishing a heartbeat the
- * thread waits for that heartbeat's seqno for PANVK_KBASE_KEEPALIVE_PROBE_MS
- * (default 2000 ms, 0 disables the probe); two consecutive misses on a live
- * queue latch the device lost and log "keepalive probe timed out, device
- * lost".  A healthy group retires the empty entry immediately, so the wait
- * never shows up as a stall, and the first heartbeat after queue creation is
- * given a grace pass so a group that is still coming up is not misread.
+ * work there is no other place to notice.  Each heartbeat is therefore
+ * probed on the next tick, before the next heartbeat is emitted: the thread
+ * waits PANVK_KBASE_KEEPALIVE_PROBE_MS (default 2000 ms, 0 disables the
+ * probe) for the seqno that heartbeat bumps, and two consecutive misses on a
+ * live queue latch the device lost with "keepalive probe timed out, device
+ * lost".  Probing first also keeps the detection alive when the emission path
+ * itself is what is stuck: a miss skips the emission instead of queueing
+ * behind it.  The emission side is bounded on its own terms - it refuses to
+ * enter the blocking ring-space wait and reports "keepalive emit stalled,
+ * device lost" when the heartbeat cannot be published within the same budget.
+ * A healthy group retires the empty entry immediately, so the wait never
+ * shows up as a stall; the first heartbeat after queue creation is given a
+ * grace pass so a group that is still coming up is not misread, and a line
+ * of "keepalive tick target/extract/space" every 5 s records that the thread
+ * is still running and where it stopped if it is not.
  */
 #define KBASE_KEEPALIVE_DEFAULT_MS 300
 /* Poll slice: keeps thread shutdown responsive without a condvar. */
@@ -978,6 +1026,9 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
  * anything) is reported instead of looking idle and healthy forever. */
 #define KBASE_KEEPALIVE_PROBE_DEFAULT_MS 2000
 #define KBASE_KEEPALIVE_PROBE_STRIKES 2u
+/* Throttled liveness trace: one line every 5 s proves the thread is alive and
+ * pins down where it stopped when it is not. */
+#define KBASE_KEEPALIVE_DIAG_NS (5ll * 1000000000ll)
 
 static int64_t
 kbase_keepalive_interval_ms(void)
@@ -1012,19 +1063,40 @@ kbase_keepalive_probe_ms(void)
  * shares the single group and for every per-subqueue group alike.
  *
  * `targets` receives, per subqueue, the seqno the published entry will bump
- * the subqueue cell to, so the caller can wait for it.  Reading it right
- * after emission may include a submission that raced in, which only makes the
- * probe wait for slightly more already-published work. */
+ * the subqueue cell to, so the caller can wait for it.  Publishing under the
+ * emission lock makes that exactly the heartbeat's own seqno.
+ *
+ * None of this may enter a blocking ring-space wait: a group that stopped
+ * consuming is precisely what the caller is trying to detect, so the entry is
+ * only attempted when the reservation cannot block, and the time the whole
+ * emission actually took is checked against `budget_ns` so a held emission
+ * lock counts as a stall too.  Returns VK_TIMEOUT when the heartbeat could
+ * not be published within the budget. */
 static VkResult
-kbase_keepalive_emit(struct panvk_gpu_queue *queue, uint64_t *targets)
+kbase_keepalive_emit(struct panvk_gpu_queue *queue, uint64_t *targets,
+                     int64_t budget_ns)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
    const uint64_t gpu_id = phys_dev->kmod.dev->props.gpu_id;
+   const uint32_t entry_max_size = kbase_ring_entry_max_size(0);
+   const int64_t start = os_time_get_nano();
 
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
       targets[i] = 0;
+
+   simple_mtx_lock(&queue->kbase_keepalive.emit_lock);
+
+   VkResult result = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      if (queue->subqueues[i].kbase.ringbuf_bo &&
+          kbase_subqueue_ring_free(queue, i, entry_max_size) == 0) {
+         result = VK_TIMEOUT;
+         goto out;
+      }
+   }
 
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       struct panvk_subqueue *subq = &queue->subqueues[i];
@@ -1032,16 +1104,21 @@ kbase_keepalive_emit(struct panvk_gpu_queue *queue, uint64_t *targets)
       if (!subq->kbase.ringbuf_bo)
          continue;
 
-      VkResult result =
-         kbase_subqueue_emit_job(queue, i, 0, 0, 0, gpu_id, NULL, 0, 0);
+      result = kbase_subqueue_emit_job_locked(queue, i, 0, 0, 0, gpu_id,
+                                              NULL, 0, 0);
       if (result != VK_SUCCESS)
-         return result;
+         goto out;
 
       kbase_subqueue_publish(queue, i);
       targets[i] = subq->kbase.emitted_jobs;
    }
 
-   return VK_SUCCESS;
+   if (os_time_get_nano() - start > budget_ns)
+      result = VK_TIMEOUT;
+
+out:
+   simple_mtx_unlock(&queue->kbase_keepalive.emit_lock);
+   return result;
 }
 
 /* Wait for the heartbeat entries just published.  A live group retires them
@@ -1094,17 +1171,54 @@ kbase_keepalive_probe(struct panvk_gpu_queue *queue, const uint64_t *targets,
    return progressed ? VK_SUCCESS : result;
 }
 
+/* Throttled liveness trace.  The keepalive thread can only report on itself,
+ * so when it stops making progress the last line printed here is the only
+ * evidence of where it died: target/extract/space are sampled before the
+ * tick does any work. */
+static void
+kbase_keepalive_diag(struct panvk_gpu_queue *queue, const uint64_t *pending,
+                     bool pending_valid)
+{
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      struct panvk_subqueue *subq = &queue->subqueues[i];
+
+      if (!subq->kbase.ringbuf_bo)
+         continue;
+
+      const uint8_t *output_page = subq->kbase.user_io.output;
+      const uint64_t extract = *(volatile uint64_t *)(output_page +
+                                 CS_USER_IO_OUTPUT_CS_EXTRACT);
+
+      mesa_logi("kbase: keepalive tick target=%" PRIu64 " extract=%" PRIu64
+                " space=%" PRIu64 " sq=%u",
+                pending_valid ? pending[i] : subq->kbase.emitted_jobs,
+                extract,
+                kbase_subqueue_ring_free(queue, i,
+                                         kbase_ring_entry_max_size(0)),
+                i);
+      /* One line per tick is enough to prove the thread is alive. */
+      return;
+   }
+}
+
 static int
 kbase_keepalive_thread(void *data)
 {
    struct panvk_gpu_queue *queue = data;
    const int64_t interval_ms = kbase_keepalive_interval_ms();
    const int64_t probe_ms = kbase_keepalive_probe_ms();
-   /* One grace heartbeat: a group that was just created may still be coming
-    * up, and a miss on the very first tick is not evidence of a wedge. */
-   bool probe_grace = probe_ms > 0;
-   uint32_t probe_strikes = 0;
+   const int64_t emit_budget_ns =
+      (probe_ms > 0 ? probe_ms : KBASE_KEEPALIVE_PROBE_DEFAULT_MS) *
+      1000000ll;
+   /* Heartbeat published on an earlier tick and not probed yet. */
+   uint64_t pending[PANVK_SUBQUEUE_COUNT] = { 0 };
+   bool pending_valid = false;
    int64_t last_probe_ns = os_time_get_nano();
+   int64_t last_diag_ns = os_time_get_nano();
+   /* One grace heartbeat: a group that was just created may still be coming
+    * up, and a miss on the first probe is not evidence of a wedge. */
+   bool probe_grace = probe_ms > 0;
+   uint32_t strikes = 0;
 
    while (!p_atomic_read(&queue->kbase_keepalive.stopping)) {
       os_time_sleep(MIN2(KBASE_KEEPALIVE_SLICE_MS, interval_ms) * 1000);
@@ -1120,6 +1234,56 @@ kbase_keepalive_thread(void *data)
          break;
       }
 
+      const int64_t now = os_time_get_nano();
+
+      if (now - last_diag_ns >= KBASE_KEEPALIVE_DIAG_NS) {
+         last_diag_ns = now;
+         kbase_keepalive_diag(queue, pending, pending_valid);
+      }
+
+      /* Probe before emitting: the probe is the only thing that can see a
+       * silent wedge, so it must never depend on the emission path being
+       * able to make progress.  When the previous heartbeat did not retire
+       * the tick ends here and this tick's emission is skipped entirely. */
+      if (probe_ms > 0 && pending_valid) {
+         if (probe_grace) {
+            probe_grace = false;
+            pending_valid = false;
+         } else {
+            VkResult pres =
+               kbase_keepalive_probe(queue, pending, (uint32_t)probe_ms);
+
+            if (pres == VK_SUCCESS) {
+               strikes = 0;
+               pending_valid = false;
+            } else if (pres != VK_TIMEOUT) {
+               mesa_loge("kbase: keepalive probe failed (VkResult %d); "
+                         "stopping the keepalive thread", (int)pres);
+               break;
+            } else {
+               strikes++;
+               if (strikes >= KBASE_KEEPALIVE_PROBE_STRIKES) {
+                  /* Pin the state the wedge was detected in: this is the only
+                   * record of what the ring looked like when the group
+                   * stopped retiring. */
+                  kbase_keepalive_diag(queue, pending, true);
+                  mesa_loge("kbase: keepalive probe timed out, device lost");
+                  kbase_latch_device_lost(queue);
+                  vk_queue_set_lost(&queue->vk,
+                                    "kbase: keepalive probe timed out");
+                  break;
+               }
+
+               mesa_logw("kbase: keepalive probe timed out (%u/%u), the "
+                         "firmware is not retiring heartbeats", strikes,
+                         KBASE_KEEPALIVE_PROBE_STRIKES);
+               /* Keep the same target: the next tick gives it one more
+                * window instead of hiding it behind a fresh heartbeat. */
+               continue;
+            }
+         }
+      }
+
       /* Idle decision under the emission lock so it cannot race an
        * in-flight submission's last_emit update; the heartbeat emissions
        * below then serialize per entry through the same lock inside
@@ -1127,7 +1291,6 @@ kbase_keepalive_thread(void *data)
        * released: emit_job() takes it per call and simple_mtx is not
        * recursive. */
       simple_mtx_lock(&queue->kbase_keepalive.emit_lock);
-      const int64_t now = os_time_get_nano();
       const bool idle =
          now - queue->kbase_keepalive.last_emit_ns >=
          interval_ms * 1000000ll;
@@ -1143,48 +1306,34 @@ kbase_keepalive_thread(void *data)
       if (!idle && !probe_due)
          continue;
 
-      uint64_t targets[PANVK_SUBQUEUE_COUNT];
-      VkResult result = kbase_keepalive_emit(queue, targets);
-      if (result != VK_SUCCESS) {
+      VkResult result = kbase_keepalive_emit(queue, pending, emit_budget_ns);
+      if (result == VK_SUCCESS) {
+         pending_valid = true;
+         last_probe_ns = os_time_get_nano();
+         continue;
+      }
+
+      if (result != VK_TIMEOUT) {
          mesa_loge("kbase: keepalive emission failed (queue likely lost); "
                    "stopping the keepalive thread");
          break;
       }
 
-      if (probe_ms <= 0)
-         continue;
-
-      if (probe_grace) {
-         probe_grace = false;
-         last_probe_ns = os_time_get_nano();
-         continue;
-      }
-
-      last_probe_ns = os_time_get_nano();
-      result = kbase_keepalive_probe(queue, targets, (uint32_t)probe_ms);
-      if (result == VK_SUCCESS) {
-         probe_strikes = 0;
-         continue;
-      }
-
-      if (result != VK_TIMEOUT) {
-         mesa_loge("kbase: keepalive probe failed (VkResult %d); stopping the "
-                   "keepalive thread", (int)result);
-         break;
-      }
-
-      probe_strikes++;
-      if (probe_strikes >= KBASE_KEEPALIVE_PROBE_STRIKES) {
-         mesa_loge("kbase: keepalive probe timed out, device lost");
+      /* No ring space, or an emission lock that stayed held for the whole
+       * budget: both mean the group is not consuming what it accepts. */
+      strikes++;
+      if (strikes >= KBASE_KEEPALIVE_PROBE_STRIKES) {
+         kbase_keepalive_diag(queue, pending, pending_valid);
+         mesa_loge("kbase: keepalive emit stalled, device lost");
          kbase_latch_device_lost(queue);
-         vk_queue_set_lost(&queue->vk,
-                           "kbase: keepalive probe timed out");
+         vk_queue_set_lost(&queue->vk, "kbase: keepalive emit stalled");
          break;
       }
 
-      mesa_logw("kbase: keepalive probe timed out (%u/%u), the firmware is "
-                "not retiring heartbeats", probe_strikes,
-                KBASE_KEEPALIVE_PROBE_STRIKES);
+      mesa_logw("kbase: keepalive emit stalled (%u/%u): no ring space or a "
+                "held emission lock for %d ms", strikes,
+                KBASE_KEEPALIVE_PROBE_STRIKES,
+                (int)(emit_budget_ns / 1000000ll));
    }
 
    return 0;
