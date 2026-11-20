@@ -1857,8 +1857,13 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev,
       struct kbase_kmod_bo *bo = pan_kmod_dev_alloc(dev, sizeof(*bo));
       if (!bo) return NULL;
       bo->dmabuf_fd = -1;
+      /* On the virtio (Windows) transport every BO map is a copy, not a
+       * coherent mmap, so GPU-written data (queue seqno/event cells, ring
+       * cursors) is only visible to the CPU through the shared-backing
+       * channel. Request it unconditionally here; the native kbase path
+       * never enters this branch. */
       if (kbv_bo_alloc(dev->fd, size, to_kbase_mem_flags(kmod_flags),
-                      !!(kmod_flags & PAN_KMOD_BO_FLAG_SHARED_BACKING), &bo->virtio_handle,
+                      true, &bo->virtio_handle,
                       &bo->virtio_gem, &bo->gpu_va, &bo->cpu_ptr)) {
          mesa_loge("kbase virtio: BO size=%" PRIu64 " flags=0x%x failed: %s", size, kmod_flags, strerror(errno));
          pan_kmod_dev_free(dev, bo); return NULL;
