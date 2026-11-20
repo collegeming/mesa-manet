@@ -268,7 +268,33 @@ int kbv_cpu_sync(const void *ptr, size_t size, uint8_t type)
    }
    pthread_mutex_unlock(&lock);
    if (fd < 0) return 0;
-   return kbv_bo_sync(fd, handle, offset, size, type) ? -1 : 1;
+   /* The host's cmd-12 sync only accepts shared-backing BOs, and CSF
+    * event memory is rejected from shared backing, so the queue BOs can
+    * never use it. Emulate the operation through the generic read/write
+    * RPCs instead: both target the live host mapping of the BO, so
+    * MSYNC pushes the local range to the GPU and CSYNC pulls the GPU's
+    * current contents back. */
+   if (offset > UINT32_MAX || size > UINT32_MAX - offset) { errno = EOVERFLOW; return -1; }
+   for (uint64_t done = 0; done < size;) {
+      size_t chunk = size - done > 1024 ? 1024 : (size_t)(size - done);
+      struct kbv_req q = {
+         .cmd = type == BASE_SYNCSET_OP_MSYNC ? 2 : 3,
+         .handle = handle,
+         .offset = (uint32_t)(offset + done),
+         .size = (uint32_t)chunk,
+      };
+      if (type == BASE_SYNCSET_OP_MSYNC)
+         memcpy(q.data, (const uint8_t *)ptr + done, chunk);
+      struct kbv_rsp r;
+      if (rpc(fd, &q, &r)) return -1;
+      if (type == BASE_SYNCSET_OP_CSYNC) {
+         if (!r.size || r.size > chunk) { errno = EPROTO; return -1; }
+         memcpy((uint8_t *)ptr + done, r.data, r.size);
+         if (r.size < chunk) { errno = EPROTO; return -1; }
+      }
+      done += chunk;
+   }
+   return 1;
 }
 static int queue_rpc(int fd, uint32_t op, uint64_t va, uint32_t csi,
                       uint32_t size, uint32_t group, struct kbv_rsp *r)
