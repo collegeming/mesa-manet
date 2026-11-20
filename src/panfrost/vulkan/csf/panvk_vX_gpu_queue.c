@@ -26,6 +26,7 @@
 #include "util/bitscan.h"
 #include "util/log.h"
 #include "util/os_time.h"
+#include "util/u_atomic.h"
 #include "vk_drm_syncobj.h"
 #include "vk_log.h"
 #include "vk_sync.h"
@@ -527,10 +528,20 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
    struct panvk_subqueue *subq = &queue->subqueues[subqueue];
    const uint32_t entry_max_size = kbase_ring_entry_max_size(wait_count);
 
+   /* The ring-emission state (insert offset, ring bytes, emitted-job count)
+    * is shared with the idle keepalive thread; hold the emission lock from
+    * reservation until the new entry is fully accounted for.  Reservation
+    * may block on a full ring (seqno wait), so entries serialize in ring
+    * order under this lock, mirroring the panthor kernel's own ring
+    * serialization.  The lock is only taken on the kbase path. */
+   simple_mtx_lock(&queue->kbase_keepalive.emit_lock);
+
    VkResult result =
       kbase_subqueue_reserve_ring(queue, subqueue, entry_max_size);
-   if (result != VK_SUCCESS)
+   if (result != VK_SUCCESS) {
+      simple_mtx_unlock(&queue->kbase_keepalive.emit_lock);
       return result;
+   }
 
    uint32_t offset = subq->kbase.insert % KBASE_RINGBUF_SIZE;
 
@@ -734,9 +745,11 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
 
    cs_end(&b);
 
-   if (!cs_is_valid(&b))
+   if (!cs_is_valid(&b)) {
+      simple_mtx_unlock(&queue->kbase_keepalive.emit_lock);
       return panvk_errorf(dev, VK_ERROR_UNKNOWN,
                           "kbase: CS ring emission failed");
+   }
 
    uint32_t entry_size = cs_root_chunk_size(&b);
    assert(entry_size <= entry_max_size);
@@ -767,6 +780,13 @@ kbase_subqueue_emit_job(struct panvk_gpu_queue *queue, uint32_t subqueue,
 
    subq->kbase.insert += padded_size;
    subq->kbase.emitted_jobs++;
+
+   /* Any ring emission counts as queue activity for the idle keepalive.
+    * Updated under the emission lock so the keepalive thread's idle
+    * decision cannot miss a just-started submission. */
+   queue->kbase_keepalive.last_emit_ns = os_time_get_nano();
+
+   simple_mtx_unlock(&queue->kbase_keepalive.emit_lock);
 
    mesa_logd("kbase: emitted subqueue %u job %" PRIu64
              ": ring offset %u, entry %u/%u bytes, stream 0x%" PRIx64
@@ -822,6 +842,152 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
    }
 
    kbase_kmod_csf_queue_kick(dev->kmod.dev, subq->kbase.ringbuf_dev);
+}
+
+/* --- Idle keepalive: host tiler-heap reclaim defense -------------------
+ *
+ * The host kernel (Pixel kbase r56p0) runs a "mali-csf-tiler-heap"
+ * shrinker which, as soon as a kctx has no on-slot CSG, scans the tiler
+ * heap and unmaps pages the firmware currently considers unused.
+ * Applications with bursty submission patterns leave exactly such idle
+ * windows between frames while previously submitted vertex/tiler work
+ * is still in flight, and the unmapped pages fault the still-running
+ * jobs (AS_FAULTSTATUS 0x045003C2, EXCEPTION_TYPE 0xC2, WRITE from the
+ * LSC), killing the CSG through add_group_fatal_error and hanging the
+ * PanVK queue.
+ *
+ * A low-frequency thread closes that window: when no ring emission has
+ * happened for PANVK_KBASE_KEEPALIVE_MS (default 300 ms), it emits one
+ * minimal ring entry (REQ_RES + context restore + HEAP_SET on graphics
+ * subqueues + the all-slot wait and seqno SYNC_ADD64, no CALL) into every
+ * live subqueue through the exact same emission and kick path as real
+ * submissions.  The kctx then always has on-slot CSGs, so the shrinker
+ * never runs.  The entry is a real in-order ring job: it does not
+ * disturb seqno targets (interleaved bumps only complete later, never
+ * earlier) and it re-arms the current tiler heap context, keeping the
+ * retired-heap accounting valid.  PANVK_KBASE_KEEPALIVE_MS=0 disables
+ * the defense entirely.
+ */
+#define KBASE_KEEPALIVE_DEFAULT_MS 300
+/* Poll slice: keeps thread shutdown responsive without a condvar. */
+#define KBASE_KEEPALIVE_SLICE_MS 50
+
+static int64_t
+kbase_keepalive_interval_ms(void)
+{
+   static int64_t interval_ms = -1;
+
+   if (interval_ms < 0) {
+      int64_t v = debug_get_num_option("PANVK_KBASE_KEEPALIVE_MS",
+                                       KBASE_KEEPALIVE_DEFAULT_MS);
+      interval_ms = MAX2(v, 0);
+   }
+
+   return interval_ms;
+}
+
+/* Emit the minimal heartbeat entry into every live subqueue and kick it.
+ * Valid in both CSG layouts: ringbuf_bo is bound for every subqueue that
+ * shares the single group and for every per-subqueue group alike. */
+static VkResult
+kbase_keepalive_emit(struct panvk_gpu_queue *queue)
+{
+   struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
+   struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(dev->vk.physical);
+   const uint64_t gpu_id = phys_dev->kmod.dev->props.gpu_id;
+
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      struct panvk_subqueue *subq = &queue->subqueues[i];
+
+      if (!subq->kbase.ringbuf_bo)
+         continue;
+
+      VkResult result =
+         kbase_subqueue_emit_job(queue, i, 0, 0, 0, gpu_id, NULL, 0, 0);
+      if (result != VK_SUCCESS)
+         return result;
+
+      kbase_subqueue_publish(queue, i);
+   }
+
+   return VK_SUCCESS;
+}
+
+static int
+kbase_keepalive_thread(void *data)
+{
+   struct panvk_gpu_queue *queue = data;
+   const int64_t interval_ms = kbase_keepalive_interval_ms();
+
+   while (!p_atomic_read(&queue->kbase_keepalive.stopping)) {
+      os_time_sleep(MIN2(KBASE_KEEPALIVE_SLICE_MS, interval_ms) * 1000);
+
+      if (p_atomic_read(&queue->kbase_keepalive.stopping))
+         break;
+
+      /* Idle decision under the emission lock so it cannot race an
+       * in-flight submission's last_emit update; the heartbeat emissions
+       * below then serialize per entry through the same lock inside
+       * kbase_subqueue_emit_job().  Emissions happen with the lock
+       * released: emit_job() takes it per call and simple_mtx is not
+       * recursive. */
+      simple_mtx_lock(&queue->kbase_keepalive.emit_lock);
+      const int64_t now = os_time_get_nano();
+      const bool idle =
+         now - queue->kbase_keepalive.last_emit_ns >=
+         interval_ms * 1000000ll;
+      simple_mtx_unlock(&queue->kbase_keepalive.emit_lock);
+
+      if (!idle)
+         continue;
+
+      VkResult result = kbase_keepalive_emit(queue);
+      if (result != VK_SUCCESS) {
+         mesa_loge("kbase: keepalive emission failed (queue likely lost); "
+                   "stopping the keepalive thread");
+         break;
+      }
+   }
+
+   return 0;
+}
+
+static void
+kbase_keepalive_start(struct panvk_gpu_queue *queue)
+{
+   const int64_t interval_ms = kbase_keepalive_interval_ms();
+
+   /* 0 disables the defense entirely. */
+   if (interval_ms <= 0)
+      return;
+
+   queue->kbase_keepalive.stopping = 0;
+   queue->kbase_keepalive.last_emit_ns = os_time_get_nano();
+
+   int ret = thrd_create(&queue->kbase_keepalive.thread,
+                         kbase_keepalive_thread, queue);
+   if (ret == thrd_error) {
+      mesa_logw("kbase: failed to start the idle keepalive thread; "
+                "the host tiler-heap reclaim defense is inactive");
+      return;
+   }
+
+   queue->kbase_keepalive.thread_started = true;
+   mesa_logi("kbase: idle keepalive active, interval %d ms",
+             (int)interval_ms);
+}
+
+static void
+kbase_keepalive_stop(struct panvk_gpu_queue *queue)
+{
+   if (!queue->kbase_keepalive.thread_started)
+      return;
+
+   p_atomic_set(&queue->kbase_keepalive.stopping, 1);
+   thrd_join(queue->kbase_keepalive.thread, NULL);
+   queue->kbase_keepalive.thread_started = false;
+   mesa_logi("kbase: idle keepalive stopped");
 }
 
 static VkResult
@@ -3618,6 +3784,12 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *dev,
 
 #ifdef HAVE_PAN_KMOD_KBASE
    const bool uses_kbase = gpu_queue_uses_kbase(dev);
+
+   /* Serializes the kbase ring-emission state between submissions and the
+    * idle keepalive thread; initialized even when the thread itself is
+    * disabled, since kbase_subqueue_emit_job() always takes it. */
+   if (uses_kbase)
+      simple_mtx_init(&queue->kbase_keepalive.emit_lock, mtx_plain);
 #else
    const bool uses_kbase = false;
 #endif
@@ -3673,6 +3845,12 @@ panvk_per_arch(create_gpu_queue)(struct panvk_device *dev,
       goto err_cleanup_created;
 
    queue->vk.driver_submit = panvk_per_arch(gpu_queue_submit);
+
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (uses_kbase)
+      kbase_keepalive_start(queue);
+#endif
+
    *out_queue = &queue->vk;
    return VK_SUCCESS;
 
@@ -3699,6 +3877,10 @@ err_destroy_syncobj:
       drmSyncobjDestroy(dev->drm_fd, queue->syncobj_handle);
 
 err_finish_queue:
+#ifdef HAVE_PAN_KMOD_KBASE
+   if (uses_kbase)
+      simple_mtx_destroy(&queue->kbase_keepalive.emit_lock);
+#endif
    vk_queue_finish(&queue->vk);
 
 err_free_queue:
@@ -3713,8 +3895,14 @@ panvk_per_arch(destroy_gpu_queue)(struct vk_queue *vk_queue)
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
 
 #ifdef HAVE_PAN_KMOD_KBASE
-   if (gpu_queue_uses_kbase(dev))
+   if (gpu_queue_uses_kbase(dev)) {
+      /* Stop the keepalive before any queue teardown so no heartbeat can
+       * land in a ring past its group's lifetime, then drop the emission
+       * lock before the potentially long final wait. */
+      kbase_keepalive_stop(queue);
+      simple_mtx_destroy(&queue->kbase_keepalive.emit_lock);
       kbase_queue_wait_current(queue, UINT64_MAX);
+   }
 #endif
 
    cleanup_queue(queue);

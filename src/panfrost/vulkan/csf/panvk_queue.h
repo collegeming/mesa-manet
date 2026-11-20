@@ -11,6 +11,9 @@
 #error "PAN_ARCH must be defined"
 #endif
 
+#include "c11/threads.h"
+#include "util/simple_mtx.h"
+
 #include "genxml/gen_macros.h"
 
 #include <stdint.h>
@@ -157,6 +160,27 @@ struct panvk_gpu_queue {
       uint64_t vt_jobs;
       uint64_t frag_jobs;
    } kbase_retired_heap;
+
+   /* Idle keepalive: host tiler-heap reclaim defense.  The host kernel
+    * runs a "mali-csf-tiler-heap" shrinker which, whenever the kctx has
+    * no on-slot CSG, unmaps tiler-heap pages the firmware still
+    * considers unused; in-flight vertex/tiler work then faults and the
+    * CSG dies.  A low-frequency thread emits a minimal ring entry into
+    * every live subqueue when the queue has been idle past
+    * PANVK_KBASE_KEEPALIVE_MS, keeping the kctx's CSGs on-slot so the
+    * shrinker never runs.  emit_lock serializes the ring-emission state
+    * (insert offset, ring bytes, emitted-job count) against submissions
+    * and the keepalive thread alike. */
+   struct {
+      simple_mtx_t emit_lock;
+      thrd_t thread;
+      bool thread_started;
+      /* Stop flag, read/written cross-thread through p_atomic. */
+      int stopping;
+      /* Last ring-emission timestamp (os_time_get_nano()); guarded by
+       * emit_lock.  Updated by every kbase_subqueue_emit_job() call. */
+      int64_t last_emit_ns;
+   } kbase_keepalive;
 #endif
 
    struct {
