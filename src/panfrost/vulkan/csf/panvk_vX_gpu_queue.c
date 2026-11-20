@@ -955,10 +955,29 @@ kbase_subqueue_publish(struct panvk_gpu_queue *queue, uint32_t subqueue)
  * earlier) and it re-arms the current tiler heap context, keeping the
  * retired-heap accounting valid.  PANVK_KBASE_KEEPALIVE_MS=0 disables
  * the defense entirely.
+ *
+ * The same thread doubles as the only liveness probe the backend has.  A
+ * wedge can be silent: the host keeps accepting ring entries (so every
+ * vkQueueSubmit returns VK_SUCCESS on a ring that still has room) while the
+ * firmware consumes nothing, and if the application never waits on its own
+ * work there is no other place to notice.  After publishing a heartbeat the
+ * thread waits for that heartbeat's seqno for PANVK_KBASE_KEEPALIVE_PROBE_MS
+ * (default 2000 ms, 0 disables the probe); two consecutive misses on a live
+ * queue latch the device lost and log "keepalive probe timed out, device
+ * lost".  A healthy group retires the empty entry immediately, so the wait
+ * never shows up as a stall, and the first heartbeat after queue creation is
+ * given a grace pass so a group that is still coming up is not misread.
  */
 #define KBASE_KEEPALIVE_DEFAULT_MS 300
 /* Poll slice: keeps thread shutdown responsive without a condvar. */
 #define KBASE_KEEPALIVE_SLICE_MS 50
+/* Liveness probe: after publishing a heartbeat entry, wait this long for its
+ * seqno before calling the group unresponsive.  Two consecutive misses latch
+ * the device lost, so a silently wedged group (submissions keep returning
+ * VK_SUCCESS because the ring has room, but the firmware never retires
+ * anything) is reported instead of looking idle and healthy forever. */
+#define KBASE_KEEPALIVE_PROBE_DEFAULT_MS 2000
+#define KBASE_KEEPALIVE_PROBE_STRIKES 2u
 
 static int64_t
 kbase_keepalive_interval_ms(void)
@@ -974,16 +993,38 @@ kbase_keepalive_interval_ms(void)
    return interval_ms;
 }
 
+static int64_t
+kbase_keepalive_probe_ms(void)
+{
+   static int64_t probe_ms = -1;
+
+   if (probe_ms < 0) {
+      int64_t v = debug_get_num_option("PANVK_KBASE_KEEPALIVE_PROBE_MS",
+                                       KBASE_KEEPALIVE_PROBE_DEFAULT_MS);
+      probe_ms = MAX2(MIN2(v, 60000), 0);
+   }
+
+   return probe_ms;
+}
+
 /* Emit the minimal heartbeat entry into every live subqueue and kick it.
  * Valid in both CSG layouts: ringbuf_bo is bound for every subqueue that
- * shares the single group and for every per-subqueue group alike. */
+ * shares the single group and for every per-subqueue group alike.
+ *
+ * `targets` receives, per subqueue, the seqno the published entry will bump
+ * the subqueue cell to, so the caller can wait for it.  Reading it right
+ * after emission may include a submission that raced in, which only makes the
+ * probe wait for slightly more already-published work. */
 static VkResult
-kbase_keepalive_emit(struct panvk_gpu_queue *queue)
+kbase_keepalive_emit(struct panvk_gpu_queue *queue, uint64_t *targets)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
    const uint64_t gpu_id = phys_dev->kmod.dev->props.gpu_id;
+
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+      targets[i] = 0;
 
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
       struct panvk_subqueue *subq = &queue->subqueues[i];
@@ -997,9 +1038,60 @@ kbase_keepalive_emit(struct panvk_gpu_queue *queue)
          return result;
 
       kbase_subqueue_publish(queue, i);
+      targets[i] = subq->kbase.emitted_jobs;
    }
 
    return VK_SUCCESS;
+}
+
+/* Wait for the heartbeat entries just published.  A live group retires them
+ * immediately (the entry carries no work), so this bounded wait is what turns
+ * the idle keepalive into a liveness probe: a group that keeps accepting ring
+ * entries while the firmware consumes nothing is wedged even though every
+ * vkQueueSubmit returns VK_SUCCESS, and only a wait on our own seqno can see
+ * it.  Returns VK_TIMEOUT when no heartbeat was retired before `probe_ms`,
+ * provided the firmware also moved no ring extract at all — a group that is
+ * merely busy retiring a long frame is alive. */
+static VkResult
+kbase_keepalive_probe(struct panvk_gpu_queue *queue, const uint64_t *targets,
+                      uint32_t probe_ms)
+{
+   /* One deadline for the whole sweep: probe_ms bounds the tick, not each
+    * subqueue. */
+   const uint64_t abs_timeout_ns =
+      os_time_get_nano() + (uint64_t)probe_ms * 1000000ull;
+   uint32_t target_mask = 0;
+   bool progressed = false;
+   VkResult result = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
+      if (targets[i])
+         target_mask |= BITFIELD_BIT(i);
+   }
+
+   if (!target_mask)
+      return VK_SUCCESS;
+
+   u_foreach_bit(sq, target_mask) {
+      const uint8_t *output_page = queue->subqueues[sq].kbase.user_io.output;
+      const uint64_t before =
+         *(volatile uint64_t *)(output_page + CS_USER_IO_OUTPUT_CS_EXTRACT);
+
+      VkResult sq_result = kbase_subqueue_wait_seqno(
+         queue, sq, targets[sq], target_mask, false, abs_timeout_ns);
+
+      const uint64_t after =
+         *(volatile uint64_t *)(output_page + CS_USER_IO_OUTPUT_CS_EXTRACT);
+      if (after != before)
+         progressed = true;
+
+      if (sq_result != VK_SUCCESS && sq_result != VK_TIMEOUT)
+         return sq_result;
+      if (sq_result == VK_TIMEOUT)
+         result = VK_TIMEOUT;
+   }
+
+   return progressed ? VK_SUCCESS : result;
 }
 
 static int
@@ -1007,6 +1099,12 @@ kbase_keepalive_thread(void *data)
 {
    struct panvk_gpu_queue *queue = data;
    const int64_t interval_ms = kbase_keepalive_interval_ms();
+   const int64_t probe_ms = kbase_keepalive_probe_ms();
+   /* One grace heartbeat: a group that was just created may still be coming
+    * up, and a miss on the very first tick is not evidence of a wedge. */
+   bool probe_grace = probe_ms > 0;
+   uint32_t probe_strikes = 0;
+   int64_t last_probe_ns = os_time_get_nano();
 
    while (!p_atomic_read(&queue->kbase_keepalive.stopping)) {
       os_time_sleep(MIN2(KBASE_KEEPALIVE_SLICE_MS, interval_ms) * 1000);
@@ -1035,15 +1133,58 @@ kbase_keepalive_thread(void *data)
          interval_ms * 1000000ll;
       simple_mtx_unlock(&queue->kbase_keepalive.emit_lock);
 
-      if (!idle)
+      /* The liveness probe has its own cadence: an application that keeps
+       * submitting faster than the keepalive interval must not be able to
+       * hide a wedged group behind a permanently fresh last_emit_ns.  A
+       * probe emission is one extra empty ring entry per probe_ms. */
+      const bool probe_due =
+         probe_ms > 0 && now - last_probe_ns >= probe_ms * 1000000ll;
+
+      if (!idle && !probe_due)
          continue;
 
-      VkResult result = kbase_keepalive_emit(queue);
+      uint64_t targets[PANVK_SUBQUEUE_COUNT];
+      VkResult result = kbase_keepalive_emit(queue, targets);
       if (result != VK_SUCCESS) {
          mesa_loge("kbase: keepalive emission failed (queue likely lost); "
                    "stopping the keepalive thread");
          break;
       }
+
+      if (probe_ms <= 0)
+         continue;
+
+      if (probe_grace) {
+         probe_grace = false;
+         last_probe_ns = os_time_get_nano();
+         continue;
+      }
+
+      last_probe_ns = os_time_get_nano();
+      result = kbase_keepalive_probe(queue, targets, (uint32_t)probe_ms);
+      if (result == VK_SUCCESS) {
+         probe_strikes = 0;
+         continue;
+      }
+
+      if (result != VK_TIMEOUT) {
+         mesa_loge("kbase: keepalive probe failed (VkResult %d); stopping the "
+                   "keepalive thread", (int)result);
+         break;
+      }
+
+      probe_strikes++;
+      if (probe_strikes >= KBASE_KEEPALIVE_PROBE_STRIKES) {
+         mesa_loge("kbase: keepalive probe timed out, device lost");
+         kbase_latch_device_lost(queue);
+         vk_queue_set_lost(&queue->vk,
+                           "kbase: keepalive probe timed out");
+         break;
+      }
+
+      mesa_logw("kbase: keepalive probe timed out (%u/%u), the firmware is "
+                "not retiring heartbeats", probe_strikes,
+                KBASE_KEEPALIVE_PROBE_STRIKES);
    }
 
    return 0;
@@ -1070,8 +1211,8 @@ kbase_keepalive_start(struct panvk_gpu_queue *queue)
    }
 
    queue->kbase_keepalive.thread_started = true;
-   mesa_logi("kbase: idle keepalive active, interval %d ms",
-             (int)interval_ms);
+   mesa_logi("kbase: idle keepalive active, interval %d ms, probe %d ms",
+             (int)interval_ms, (int)kbase_keepalive_probe_ms());
 }
 
 static void
